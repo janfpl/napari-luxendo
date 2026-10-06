@@ -1,0 +1,11 @@
+name: napari-luxendo
+display_name: Luxendo H5 Reader
+contributions:
+  commands:
+    - id: napari-luxendo.get_reader
+      python_name: napari_luxendo._reader:napari_get_reader
+      title: Open Luxendo .lux.h5 data
+  readers:
+    - command: napari-luxendo.get_reader
+      accepts_directories: false
+      filename_patterns: ["*.lux.h5", "*.h5", "*.ims"]

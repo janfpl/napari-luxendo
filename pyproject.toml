@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-luxendo"
+dynamic = ["version"]
+description = "napari reader for Luxendo light-sheet .lux.h5 files, with pyramids, voxel scaling and Imaris/BigDataViewer header support"
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "Jan C. Frankowski" }]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: napari",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "numpy>=1.23",
+    "dask[array]>=2023.1.0",
+    "h5py>=3.7",
+]
+
+[project.optional-dependencies]
+napari = ["napari[all]>=0.4.18"]
+testing = ["pytest>=7.0", "npe2"]
+
+[project.entry-points."napari.manifest"]
+napari-luxendo = "napari_luxendo:napari.yaml"
+
+[project.urls]
+"Source Code" = "https://github.com/janfpl/napari-luxendo"
+"Bug Tracker" = "https://github.com/janfpl/napari-luxendo/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+napari_luxendo = ["napari.yaml"]
+
+[tool.setuptools_scm]
+write_to = "src/napari_luxendo/_version.py"
+fallback_version = "0.1.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

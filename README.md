@@ -1,22 +1,30 @@
 # napari-luxendo
 
 A [napari](https://napari.org) reader plugin for Luxendo / Bruker light-sheet
-`.lux.h5` data. It reads data only: there are no widgets, no processing and no
-writer.
+[Luxendo Image](https://github.com/Luxendo/luxendo-image) (`.lux.h5`) data:
+single volumes, tiled acquisitions, multiview and time series. It reads data
+only: there are no widgets, no processing and no writer.
 
-- **Lazy loading.** Volumes are opened as dask arrays, so napari reads only the
-  planes you view, even for multi-hundred-GB files.
-- **Resolution pyramids.** `Data_W_H_D` datasets are shown as one napari
-  multiscale layer.
-- **Physical scale.** The voxel size (µm) in the embedded metadata sets the
-  layer scale, so Z and XY have the right aspect ratio.
-- **Companion headers.** Opening an Imaris `.ims` or BigDataViewer `*_bdv.h5`
-  header loads every channel it links to, with timepoints stacked on a T axis.
-- **Channel naming and colors.** Layers are named from the channel description
-  or the header channel name. Colors come from the `.ims` channel color, else a
-  wavelength or color word in the name (e.g. `Red-561`), else a per-channel
-  default. Multi-channel loads use additive blending.
-- **Metadata.** The full Luxendo JSON metadata is attached to `layer.metadata`.
+- **Lazy loading.** Volumes are opened as dask arrays, so napari reads only
+  what you view, even for multi-hundred-GB experiments.
+- **Whole experiments from one file.** Opening a main file
+  (`main_raw.lux.h5`, `main_processed.lux.h5`) loads every tile, camera, view,
+  channel and timepoint it links to.
+- **Sample-space placement.** Each view is positioned with its
+  `affine_to_sample` transform (scaling, camera flips, stage translation and
+  rotation), so tiles and views land where they were in the sample.
+- **Tile mosaics.** Tiles of the same channel are stitched into a single lazy
+  mosaic layer. Each pixel comes from the tile whose centre is closest, so
+  seams sit midway through the overlaps. Channels are separate layers added
+  together.
+- **Time series.** Timepoints are stacked on a T axis (napari's time slider).
+- **Resolution pyramids.** `Data_W_H_D` datasets become napari multiscale
+  levels. For a mosaic, the levels are stitched the same way.
+- **Companion headers.** Imaris `.ims` and BigDataViewer `*.h5` headers work
+  too. They resolve to the same `.lux.h5` files and are placed the same way.
+- **Channel colours and contrast.** Every tile of a channel shares one
+  colormap and one set of contrast limits.
+- **Metadata.** The Luxendo JSON metadata is attached to `layer.metadata`.
 
 ## Installation
 
@@ -39,8 +47,8 @@ Drag a file onto the napari window, use **File > Open File(s)…**, or from Pyth
 import napari
 
 viewer = napari.Viewer()
-viewer.open("uni_tp-0_ch-0.lux.h5", plugin="napari-luxendo")   # one channel
-viewer.open("dataset.ims", plugin="napari-luxendo")            # every channel in the header
+viewer.open("2025-08-15_150000/main_raw.lux.h5", plugin="napari-luxendo")  # whole experiment
+viewer.open("Cam_long_00000.lux.h5", plugin="napari-luxendo")              # one view
 napari.run()
 ```
 
@@ -59,25 +67,64 @@ vol.voxel_size_um   # (z, y, x) or None
 
 | File | What is loaded |
 |------|----------------|
-| `*.lux.h5` | `Data` plus any `Data_W_H_D` pyramid levels, as one layer |
-| `*.ims` (Luxendo header) | One layer per channel, following the header's external links. Native Imaris files that store their own pixels are not claimed. |
-| `*_bdv.h5` (+ optional `*_bdv.xml`) | One layer per BDV setup. Names and voxel size come from the XML when present. |
+| `main_raw.lux.h5`, `main_processed.lux.h5`, other nested `.lux.h5` | Everything under `timepoint_*/channel_*/<view>/`, following the external links into `raw/` and `processed/` |
+| `*.lux.h5` (flat) | One view: `Data` plus any `Data_W_H_D` levels. Passing several tile / timepoint files in one call (*File > Open Files as Stack…*, or a list from Python) gives a mosaic and time series. Plain *Open Files* opens each file separately. |
+| `*.ims` (Luxendo header) | One entry per channel, following the header's external links. Native Imaris files that store their own pixels are not claimed. |
+| BigDataViewer `*.h5` (+ `*.xml`) | One entry per setup. Setups with the same `channel` attribute become one mosaic. |
 
-Any other `.h5` file without a `Data` dataset is left to other readers.
+Any other `.h5` file without Luxendo structure is left to other readers.
+Incomplete `.lux.h5.part` files are never opened.
 
-### Notes
+### How data is arranged into layers
 
+1. **Views.** Every source is reduced to views, one per tile, camera,
+   objective, channel and timepoint.
+2. **Series.** The same view across timepoints forms one series, stacked on a
+   T axis. A timepoint a view doesn't have is shown empty.
+3. **Mosaics.** Series of one channel that share orientation and voxel size
+   (the same linear part of `affine_to_sample`) are stitched into one mosaic
+   layer. Tile offsets are rounded to the nearest voxel of the shared grid, so
+   a tile can be up to half a voxel from its exact position. Views at a
+   different rotation angle, camera flip or voxel size get their own layer.
+4. **Placement.** Each layer gets an `affine`, so napari's world coordinates
+   are sample-space micrometres.
+
+### Options
+
+Set these as environment variables before starting napari, or pass the
+matching keyword to `napari_luxendo.read_luxendo(...)`:
+
+| Variable | Keyword | Values |
+|----------|---------|--------|
+| `NAPARI_LUXENDO_TRANSFORM` | `transform` | `sample` (default): place with `affine_to_sample`. `voxel`: scale by the voxel size only, as for a viewer that can't apply the affine. |
+| `NAPARI_LUXENDO_TILES` | `tiles` | `mosaic` (default) or `separate`: one layer per tile. With separate tiles, overlaps blend additively. |
+| `NAPARI_LUXENDO_VIEWS` | `views` | `ask` (default): when a main file has both `raw_*` and `proc_*` views, a dialog asks which to load; outside napari the default is processed. `raw` or `proc` skips the question. |
+
+### Things to know
+
+- **Rotated views (multiview / MuVi angles) look right in 3D only.** napari
+  can't slice a rotated volume obliquely in 2D. It warns and shows the
+  volume's own planes without the rotation. Tile grids with only flips and
+  translations are exact in 2D.
+- **Changing transforms over time.** If a view's `affine_to_sample` changes
+  between timepoints (e.g. drift-corrected data), every timepoint is placed
+  with the first one and a warning is shown.
+- **Missing files** (moved, or not yet copied) are skipped with a warning.
+  Their region stays empty.
+- **Performance without pyramids.** Raw tiles are often stored without
+  `Data_2_2_2` etc., and are chunked 64×64×64. Showing one plane then reads
+  64 planes of every tile it covers, and the whole-mosaic 3D view reads
+  everything. Generating pyramids, e.g. in the Luxendo Image Processor, makes
+  large mosaics much faster to browse.
+- **Contrast.** Initial contrast limits are the 0.05–99.95 percentiles of a
+  small central block from up to six views of each channel, so loading never
+  scans whole volumes.
 - **File handles.** h5py files stay open as long as their layers can read
   from them. To release them, remove the layers and call
   `napari_luxendo.close_all()`.
-- **Contrast.** Initial contrast limits are the 0.05–99.95 percentiles of the
-  coarsest pyramid level, or of the central Z plane when there is no pyramid,
-  so the reader never scans a full-resolution volume.
-- **Timepoints.** If timepoints in a header don't share one shape, only the
-  first timepoint is shown and a warning is logged.
-- **Header links.** A header must sit in the same folder as the channel files
-  it links to. Links written as absolute paths from the acquisition PC are
-  resolved by filename next to the header.
+- **Moving data.** Main files and headers link to the tile files by relative
+  path. Copy or move the experiment folder as a whole. Links written as
+  absolute Windows paths are resolved by filename next to the linking file.
 
 ## Development
 

@@ -73,7 +73,7 @@ def test_ims_header(lux_dir):
     assert kwargs["scale"] == [1.0, 2.0, 0.5, 0.4]
     assert kwargs["blending"] == "additive"
     assert kwargs["colormap"]["colors"][1] == [1.0, 0.0, 1.0, 1.0]
-    assert kwargs["metadata"]["header"].endswith("dataset.ims")
+    assert kwargs["metadata"]["source"].endswith("dataset.ims")
     assert len(kwargs["metadata"]["files"]) == 2
 
 
@@ -95,14 +95,20 @@ def test_header_falls_back_to_header_voxel_size(lux_dir):
 def test_header_with_missing_channel_file(lux_dir):
     (lux_dir / "uni_tp-1_ch-0.lux.h5").unlink()
     reader = napari_get_reader(str(lux_dir / "dataset.ims"))
-    with pytest.raises(FileNotFoundError, match="uni_tp-1_ch-0"):
-        reader(str(lux_dir / "dataset.ims"))
+    with pytest.warns(UserWarning, match="uni_tp-1_ch-0"):
+        layers = reader(str(lux_dir / "dataset.ims"))
+    levels = layers[0][0]
+    assert levels[0].shape == (2, *SHAPE)
+    assert not np.asarray(levels[0][1]).any()  # missing timepoint left empty
+    np.testing.assert_array_equal(np.asarray(levels[0][0]), make_volume(0))
 
 
-def test_mismatched_timepoints_use_first(lux_dir):
+def test_mismatched_timepoints_are_left_empty(lux_dir):
     write_lux(lux_dir / "uni_tp-1_ch-0.lux.h5", make_volume(5, shape=(10, 40, 48)))
-    levels, _, _ = _read(lux_dir / "dataset.ims")[0]
-    assert levels[0].shape == SHAPE
+    with pytest.warns(UserWarning, match="differ in shape"):
+        levels, _, _ = _read(lux_dir / "dataset.ims")[0]
+    assert levels[0].shape == (2, *SHAPE)
+    assert not np.asarray(levels[0][1]).any()
 
 
 def test_list_of_files_gets_distinct_colormaps(tmp_path):

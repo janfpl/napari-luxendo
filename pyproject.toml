@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "napari-luxendo"
 dynamic = ["version"]
-description = "napari reader for Luxendo light-sheet .lux.h5 files, with pyramids, voxel scaling and Imaris/BigDataViewer header support"
+description = "napari reader for Luxendo light-sheet .lux.h5 data: tiled mosaics, multiview and time series placed in sample space"
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
 authors = [{ name = "Jan C. Frankowski" }]

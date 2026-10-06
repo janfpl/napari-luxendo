@@ -35,3 +35,18 @@ def test_layers_build_in_napari(lux_dir):
     np.testing.assert_allclose(gfp.colormap.colors[-1], [0, 1, 0, 1])
     assert gfp.blending == "additive"
     assert gfp.data.shapes[0] == (2, *SHAPE)
+
+
+def test_tiled_time_series_builds_in_napari(tiled_experiment):
+    path = str(tiled_experiment / "main_raw.lux.h5")
+    layers = [Layer.create(*ld) for ld in napari_get_reader(path)(path)]
+    assert len(layers) == 2
+    mosaic = layers[0]
+    assert mosaic.ndim == 4 and mosaic.multiscale
+    assert mosaic.data.shapes[0][0] == 2  # two timepoints
+    np.testing.assert_allclose(np.diag(mosaic.affine.affine_matrix)[1:4], [-5.0, 2.925, 2.925])
+    # A voxel maps to the same sample position through napari as through the metadata.
+    np.testing.assert_allclose(
+        mosaic.data_to_world((0, 0, 0, 0))[1:],
+        mosaic.affine.affine_matrix[1:4, 4],
+    )

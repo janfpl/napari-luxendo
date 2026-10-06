@@ -1,17 +1,43 @@
-"""napari reader for Luxendo ``.lux.h5`` channel files and their headers."""
+"""napari reader for Luxendo Image data.
+
+Accepts flat ``.lux.h5`` files (one view each), nested / "main" files
+(``main_raw.lux.h5`` ...) linking a whole experiment, and Imaris ``.ims`` /
+BigDataViewer ``*.h5`` headers that link to ``.lux.h5`` files.
+
+Every source is reduced to *views* (one tile / camera / channel at one
+timepoint). Views are grouped into time series, series of the same channel are
+stitched into one mosaic layer, and each layer is placed in sample space with
+``affine_to_sample``.
+
+Behaviour can be changed with keyword arguments to :func:`read_luxendo` or,
+from the napari GUI, with environment variables:
+
+``NAPARI_LUXENDO_TRANSFORM``  ``sample`` (default) or ``voxel``: place layers
+    with ``affine_to_sample``, or only scale them by the voxel size.
+``NAPARI_LUXENDO_TILES``  ``mosaic`` (default) or ``separate``: stitch the
+    tiles of a channel into one layer, or give every tile its own layer.
+``NAPARI_LUXENDO_VIEWS``  ``ask`` (default), ``raw`` or ``proc``: which views
+    to load when a main file has both raw and processed ones.
+"""
 
 from __future__ import annotations
 
 import logging
+import os
 import re
+import warnings
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import dask.array as da
 import numpy as np
 
-from ._headers import HeaderChannel, HeaderInfo, read_bdv_header, read_ims_header
-from ._lux import LuxVolume, is_lux_file, open_lux_volume
+from ._headers import HeaderInfo, read_bdv_header, read_ims_header
+from ._lux import LuxVolume, is_lux_view, open_h5, open_lux_group, open_lux_volume
+from ._main import NestedView, is_nested_file, iter_nested_views, timepoint_index
+from ._mosaic import MosaicLayout, build_mosaic_levels, plan_layout, same_linear
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +46,9 @@ LayerData = tuple[Any, dict[str, Any], str]
 # Colormaps cycled through for channels with no color hint.
 _CHANNEL_COLORMAPS = ("green", "magenta", "cyan", "yellow", "red", "blue")
 
-# Contrast limits are estimated from at most this many voxels.
-_CONTRAST_SAMPLE_VOXELS = 16_000_000
+# Contrast limits are estimated from at most this many voxels per sampled view.
+_CONTRAST_SAMPLE_VOXELS = 4_000_000
+_CONTRAST_MAX_VIEWS = 6
 
 
 def napari_get_reader(path: str | list[str]) -> Callable[..., list[LayerData]] | None:
@@ -33,7 +60,7 @@ def napari_get_reader(path: str | list[str]) -> Callable[..., list[LayerData]] |
 
 
 def _classify(path: Path) -> str | None:
-    """Return ``"lux"``, ``"ims"``, ``"bdv"`` or None for *path*."""
+    """Return ``"lux"``, ``"nested"``, ``"ims"``, ``"bdv"`` or None for *path*."""
     name = path.name.lower()
     if not path.is_file() or not name.endswith((".h5", ".ims")):
         return None
@@ -43,8 +70,10 @@ def _classify(path: Path) -> str | None:
         with h5py.File(str(path), "r") as f:
             if name.endswith(".ims"):
                 return "ims" if read_ims_header(path, f) else None
-            if is_lux_file(f):
+            if is_lux_view(f):
                 return "lux"
+            if is_nested_file(f):
+                return "nested"
             if read_bdv_header(path, f):
                 return "bdv"
     except Exception as exc:
@@ -52,27 +81,178 @@ def _classify(path: Path) -> str | None:
     return None
 
 
-def read_luxendo(path: str | list[str]) -> list[LayerData]:
-    """Read one or more ``.lux.h5`` / ``.ims`` / ``*_bdv.h5`` files into layers."""
-    paths = [path] if isinstance(path, (str, Path)) else list(path)
+# --------------------------------------------------------------------------- #
+# Collecting views
+# --------------------------------------------------------------------------- #
 
-    channels: list[tuple[HeaderChannel, HeaderInfo | None]] = []
+
+@dataclass
+class _View:
+    volume: LuxVolume
+    timepoint: int
+    series: tuple  # identifies one tile/camera/channel across time
+    group: tuple  # tiles of one channel (candidates for one mosaic)
+    color_key: str  # views sharing this share a colormap and contrast limits
+    label: str  # layer name if the series gets its own layer
+    group_label: str  # layer name for a mosaic of the group
+    source: str  # the file that was opened (lux file, main file or header)
+    color: Optional[tuple[float, float, float]] = None
+
+
+def _option(value: str | None, env: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = value or os.environ.get(env, "") or default
+    value = value.strip().lower()
+    if value not in allowed:
+        raise ValueError(f"{env}/{value!r}: expected one of {allowed}")
+    return value
+
+
+def read_luxendo(
+    path: str | list[str],
+    *,
+    transform: str | None = None,
+    tiles: str | None = None,
+    views: str | None = None,
+) -> list[LayerData]:
+    """Read Luxendo files / headers into napari layer data.
+
+    Parameters
+    ----------
+    transform : {"sample", "voxel"}
+        Place layers with ``affine_to_sample`` (default) or by voxel size only.
+    tiles : {"mosaic", "separate"}
+        Stitch the tiles of each channel into one layer (default), or one layer
+        per tile. Mosaics need ``transform="sample"``.
+    views : {"ask", "raw", "proc"}
+        Which views to load from a main file holding both raw and processed
+        views. ``"ask"`` (default) shows a dialog inside napari and falls back
+        to processed views elsewhere.
+    """
+    transform = _option(transform, "NAPARI_LUXENDO_TRANSFORM", "sample", ("sample", "voxel"))
+    tiles = _option(tiles, "NAPARI_LUXENDO_TILES", "mosaic", ("mosaic", "separate"))
+    views = _option(views, "NAPARI_LUXENDO_VIEWS", "ask", ("ask", "raw", "proc"))
+
+    paths = [path] if isinstance(path, (str, Path)) else list(path)
+    collected: list[_View] = []
+    flat: list[LuxVolume] = []
     for p in map(Path, paths):
         kind = _classify(p)
         if kind == "lux":
-            channels.append((HeaderChannel(files=[p]), None))
+            flat.append(open_lux_volume(p))
+        elif kind == "nested":
+            collected.extend(_views_from_nested(p, views))
         elif kind in ("ims", "bdv"):
-            header = _read_header(p, kind)
-            for ch in header.channels:
-                channels.append((ch, header))
+            collected.extend(_views_from_header(_read_header(p, kind)))
         else:
             raise ValueError(f"{p.name}: not a Luxendo .lux.h5 file or header")
+    collected.extend(_views_from_flat(flat))
+    if not collected:
+        raise ValueError("No readable Luxendo views found.")
+    return _build_layers(collected, transform=transform, mosaic=tiles == "mosaic")
 
-    multi = len(channels) > 1
-    layers = []
-    for index, (channel, header) in enumerate(channels):
-        layers.append(_channel_layer(channel, header, index, multi))
-    return layers
+
+def _warn(message: str) -> None:
+    """Surface a problem as a napari notification (and in the log)."""
+    logger.warning(message)
+    warnings.warn(message, UserWarning, stacklevel=3)
+
+
+def _views_from_flat(volumes: list[LuxVolume]) -> list[_View]:
+    """Flat files: group by the view identity in their metadata."""
+    out: list[_View] = []
+    seen: dict[tuple, set[int]] = {}
+    for i, vol in enumerate(volumes):
+        md = vol.metadata
+        identity = tuple(md.get(k) for k in ("channel", "stack", "objective", "camera"))
+        t = _int_or(md.get("time_point"), 0)
+        series = ("flat",) + identity if any(identity) else ("flat-file", str(vol.path))
+        if t in seen.setdefault(series, set()):
+            series = series + (i,)  # same view and timepoint twice: keep both
+        seen.setdefault(series, set()).add(t)
+        channel_label = md.get("channel_description") or (
+            f"ch {md['channel']}" if "channel" in md else None
+        )
+        parts = [channel_label or vol.name]
+        if md.get("stack"):
+            parts.append(f"st:{md['stack']}")
+        cam = "/".join(x for x in (md.get("objective"), md.get("camera")) if x)
+        if cam and md.get("stack"):
+            parts.append(cam)
+        out.append(
+            _View(
+                volume=vol,
+                timepoint=t,
+                series=series,
+                group=("flat", md.get("channel") or channel_label or str(vol.path),
+                       md.get("objective"), md.get("camera")),
+                color_key=md.get("channel") or channel_label or str(vol.path),
+                label=" ".join(parts),
+                group_label=" ".join([channel_label or vol.name] + ([cam] if cam else [])),
+                source=str(vol.path),
+            )
+        )
+    return out
+
+
+def _views_from_nested(path: Path, choice: str) -> list[_View]:
+    f = open_h5(path)
+    nested = list(iter_nested_views(f))
+    kinds = {v.kind for v in nested}
+    if {"raw", "proc"} <= kinds:
+        keep = _choose_raw_or_proc(path) if choice == "ask" else choice
+        nested = [v for v in nested if v.kind in (keep, "other")]
+
+    tp_names = sorted({v.timepoint for v in nested}, key=lambda n: timepoint_index(n, 0))
+    tp_index = {name: timepoint_index(name, i) for i, name in enumerate(tp_names)}
+    out: list[_View] = []
+    missing: list[str] = []
+    for nv in nested:
+        try:
+            vol = open_lux_group(nv.group, path, view_name=nv.view)
+        except FileNotFoundError as exc:
+            missing.append(str(exc))
+            continue
+        except ValueError as exc:
+            logger.info("Skipping %s: %s", nv.group.name, exc)
+            continue
+        md = vol.metadata
+        channel_label = md.get("channel_description") or f"channel_{nv.channel}"
+        out.append(
+            _View(
+                volume=vol,
+                timepoint=tp_index[nv.timepoint],
+                series=("nested", str(path), nv.channel, nv.view),
+                group=("nested", str(path), nv.channel, nv.kind),
+                color_key=md.get("channel") or nv.channel,
+                label=f"{channel_label} {nv.view}",
+                group_label=f"{channel_label}" + (f" ({nv.kind})" if nv.kind != "other" else ""),
+                source=str(path),
+            )
+        )
+    if missing:
+        _warn(f"{path.name}: {len(missing)} linked file(s) missing, e.g. {missing[0]}")
+    return out
+
+
+def _choose_raw_or_proc(path: Path) -> str:
+    """Ask in napari whether to load raw or processed views."""
+    try:
+        from qtpy.QtWidgets import QApplication, QMessageBox
+
+        if QApplication.instance() is not None:
+            roles = getattr(QMessageBox, "ButtonRole", QMessageBox)  # Qt6 scoped enums
+            box = QMessageBox()
+            box.setWindowTitle("Luxendo: raw or processed?")
+            box.setText(f"{path.name} contains both raw and processed views.\nWhich should be loaded?")
+            proc = box.addButton("Processed", roles.AcceptRole)
+            box.addButton("Raw", roles.RejectRole)
+            box.setDefaultButton(proc)
+            (box.exec() if hasattr(box, "exec") else box.exec_())
+            return "proc" if box.clickedButton() is proc else "raw"
+    except Exception as exc:  # no Qt available
+        logger.debug("No Qt dialog: %s", exc)
+    logger.info("%s has raw and processed views; loading processed.", path.name)
+    return "proc"
 
 
 def _read_header(path: Path, kind: str) -> HeaderInfo:
@@ -81,90 +261,234 @@ def _read_header(path: Path, kind: str) -> HeaderInfo:
     with h5py.File(str(path), "r") as f:
         info = read_ims_header(path, f) if kind == "ims" else read_bdv_header(path, f)
     assert info is not None  # _classify already checked
-    missing = [str(p) for ch in info.channels for p in ch.files if not p.is_file()]
-    if missing:
-        raise FileNotFoundError(
-            f"{path.name} links to channel files that are missing: " + ", ".join(missing)
-        )
     return info
 
 
-def _channel_layer(
-    channel: HeaderChannel, header: HeaderInfo | None, index: int, multi: bool
-) -> LayerData:
-    volumes = [open_lux_volume(p) for p in channel.files]
-    first = volumes[0]
-    levels = _stack_timepoints(volumes)
-    has_time = levels[0].ndim == 4
-
-    voxel = first.voxel_size_um or (header.voxel_size_um if header else None)
-    scale = list(voxel) if voxel else [1.0, 1.0, 1.0]
-    if has_time:
-        scale = [1.0, *scale]
-
-    name = channel.name or first.name
-    kwargs: dict[str, Any] = {
-        "name": name,
-        "scale": scale,
-        "colormap": _pick_colormap(channel, first, index, multi),
-        "blending": "additive" if multi else "translucent",
-        "multiscale": len(levels) > 1,
-        "metadata": {
-            "luxendo": first.metadata.get("raw", {}),
-            "path": str(first.path),
-            "files": [str(v.path) for v in volumes],
-            "header": str(header.path) if header else None,
-            "pyramid_levels": first.level_names[: len(levels)],
-            "voxel_size_um": voxel,
-        },
-    }
-    limits = _estimate_contrast_limits(first)
-    if limits is not None:
-        kwargs["contrast_limits"] = limits
-
-    data = levels if len(levels) > 1 else levels[0]
-    return data, kwargs, "image"
+def _views_from_header(header: HeaderInfo) -> list[_View]:
+    out: list[_View] = []
+    missing: list[str] = []
+    for idx, ch in enumerate(header.channels):
+        tps = ch.timepoints or list(range(len(ch.files)))
+        for t, file in zip(tps, ch.files):
+            if not file.is_file():
+                missing.append(str(file))
+                continue
+            vol = open_lux_volume(file)
+            if vol.voxel_size_um is None and header.voxel_size_um:
+                vol.metadata["voxel_size_um"] = header.voxel_size_um
+            channel = ch.channel if ch.channel is not None else str(idx)
+            channel_label = ch.channel_name or vol.metadata.get("channel_description") or f"ch {channel}"
+            out.append(
+                _View(
+                    volume=vol,
+                    timepoint=t,
+                    series=("header", str(header.path), idx),
+                    group=("header", str(header.path), channel),
+                    color_key=vol.metadata.get("channel") or channel,
+                    label=ch.name or vol.name,
+                    group_label=channel_label,
+                    source=str(header.path),
+                    color=ch.color,
+                )
+            )
+    if missing:
+        _warn(f"{header.path.name}: {len(missing)} linked file(s) missing, e.g. {missing[0]}")
+    return out
 
 
-def _stack_timepoints(volumes: list[LuxVolume]) -> list[da.Array]:
-    """Stack each resolution level across timepoints into ``(T, Z, Y, X)``.
+def _int_or(value: Any, default: int) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
 
-    A single timepoint is returned unchanged as ``(Z, Y, X)``. If timepoints
-    disagree in shape or dtype, only the first one is used.
-    """
-    if len(volumes) == 1:
-        return volumes[0].levels
-    first = volumes[0]
-    if any(v.shape != first.shape or v.dtype != first.dtype for v in volumes[1:]):
-        logger.warning(
-            "%s: timepoints differ in shape or dtype; showing only the first.",
-            first.path.name,
-        )
-        return first.levels
-    n_levels = 1
-    for k in range(1, len(first.levels)):
-        if all(
-            len(v.levels) > k and v.levels[k].shape == first.levels[k].shape
-            for v in volumes
-        ):
-            n_levels = k + 1
+
+# --------------------------------------------------------------------------- #
+# Building layers
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _Series:
+    key: tuple
+    by_time: dict[int, LuxVolume]
+    first: _View
+
+    @property
+    def reference(self) -> LuxVolume:
+        return self.by_time[min(self.by_time)]
+
+
+def _build_layers(views: list[_View], *, transform: str, mosaic: bool) -> list[LayerData]:
+    series: OrderedDict[tuple, _Series] = OrderedDict()
+    for v in views:
+        s = series.setdefault(v.series, _Series(v.series, {}, v))
+        s.by_time[v.timepoint] = v.volume
+    timepoints = sorted({v.timepoint for v in views})
+    use_affine = transform == "sample"
+
+    # Group series into layers: one mosaic per channel group (when the tiles
+    # share orientation and voxel size), otherwise one layer per series.
+    groups: OrderedDict[tuple, list[_Series]] = OrderedDict()
+    for s in series.values():
+        groups.setdefault(s.first.group, []).append(s)
+
+    plans: list[list[_Series]] = []
+    for members in groups.values():
+        if not (use_affine and mosaic and len(members) > 1):
+            plans.extend([m] for m in members)
+            continue
+        buckets: list[list[_Series]] = []
+        for m in members:
+            ref = m.reference
+            if ref.affine is None:
+                buckets.append([m])
+                continue
+            for b in buckets:
+                r0 = b[0].reference
+                if r0.affine is not None and same_linear(r0.affine, ref.affine) \
+                        and r0.dtype == ref.dtype and r0.data.ndim == ref.data.ndim:
+                    b.append(m)
+                    break
+            else:
+                buckets.append([m])
+        plans.extend(buckets)
+
+    color_keys = list(OrderedDict.fromkeys(s.first.color_key for s in series.values()))
+    limits = {k: _contrast_for([s.reference for s in series.values() if s.first.color_key == k])
+              for k in color_keys}
+    multi = len(plans) > 1
+
+    layers = []
+    for members in plans:
+        first = members[0].first
+        if len(members) == 1:
+            levels, affine = _single_levels(members[0], timepoints), members[0].reference.affine
+            name = first.label
         else:
-            break
-    return [da.stack([v.levels[k] for v in volumes]) for k in range(n_levels)]
+            levels, affine = _mosaic_levels(members, timepoints)
+            name = f"{first.group_label} mosaic ({len(members)} tiles)"
+        _check_drift(members)
 
-
-def _pick_colormap(
-    channel: HeaderChannel, volume: LuxVolume, index: int, multi: bool
-) -> Any:
-    """Header color, else a color named by the channel, else a default."""
-    if channel.color is not None:
-        return {
-            "colors": [[0.0, 0.0, 0.0, 1.0], [*channel.color, 1.0]],
-            "name": f"luxendo-{'-'.join(f'{c:.3g}' for c in channel.color)}",
+        ref = members[0].reference
+        has_time = len(timepoints) > 1
+        kwargs: dict[str, Any] = {
+            "name": name,
+            "colormap": _pick_colormap(first, color_keys.index(first.color_key), len(color_keys) > 1),
+            "blending": "additive" if multi else "translucent",
+            "multiscale": len(levels) > 1,
+            "metadata": {
+                "luxendo": ref.metadata.get("raw", {}),
+                "source": first.source,
+                "path": str(ref.path),
+                "files": sorted({str(v.path) for s in members for v in s.by_time.values()}),
+                "views": [s.reference.view_name or s.reference.path.name for s in members],
+                "timepoints": timepoints,
+                "pyramid_levels": ref.level_names[: len(levels)],
+                "voxel_size_um": ref.voxel_size_um,
+                "placement": "affine_to_sample" if use_affine and affine is not None else "voxel_size",
+            },
         }
-    hint = colormap_from_description(channel.name or volume.metadata.get("channel_description", ""))
-    if hint:
-        return hint
+        if use_affine and affine is not None:
+            kwargs["affine"] = _with_time(affine, has_time)
+        else:
+            voxel = ref.voxel_size_um
+            scale = list(voxel) if voxel else [1.0, 1.0, 1.0]
+            kwargs["scale"] = [1.0, *scale] if has_time else scale
+        if limits.get(first.color_key) is not None:
+            kwargs["contrast_limits"] = limits[first.color_key]
+
+        data = levels if len(levels) > 1 else levels[0]
+        layers.append((data, kwargs, "image"))
+    return layers
+
+
+def _with_time(affine: np.ndarray, has_time: bool) -> np.ndarray:
+    if not has_time:
+        return affine
+    out = np.eye(5)
+    out[1:, 1:] = affine
+    return out
+
+
+def _single_levels(s: _Series, timepoints: list[int]) -> list[da.Array]:
+    """Levels of one series, stacked across *timepoints* when there are several."""
+    ref = s.reference
+    if len(timepoints) == 1:
+        return ref.levels
+    n_levels = min(len(v.levels) for v in s.by_time.values())
+    bad = [t for t, v in s.by_time.items() if v.shape != ref.shape or v.dtype != ref.dtype]
+    if bad:
+        _warn(f"{s.first.label}: timepoint(s) {bad} differ in shape or dtype and are left empty.")
+    out = []
+    for k in range(n_levels):
+        frames = []
+        for t in timepoints:
+            v = s.by_time.get(t)
+            if v is None or t in bad or v.levels[k].shape != ref.levels[k].shape:
+                frames.append(da.zeros_like(ref.levels[k]))
+            else:
+                frames.append(v.levels[k])
+        out.append(da.stack(frames))
+    return out
+
+
+def _mosaic_levels(members: list[_Series], timepoints: list[int]) -> tuple[list[da.Array], np.ndarray]:
+    layout: MosaicLayout = plan_layout([m.reference for m in members])
+    if layout.residual_vx > 0.05:
+        logger.info(
+            "%s: tile positions rounded to the voxel grid (max %.2f voxel).",
+            members[0].first.group_label, layout.residual_vx,
+        )
+    refs = [m.reference for m in members]
+    per_t = []
+    for t in timepoints:
+        tiles = []
+        for m, ref in zip(members, refs):
+            v = m.by_time.get(t)
+            if v is not None and (v.shape != ref.shape or v.dtype != ref.dtype):
+                _warn(f"{m.first.label}: timepoint {t} has a different shape; left empty.")
+                v = None
+            tiles.append(v)
+        per_t.append(build_mosaic_levels(layout, refs, tiles))
+    if len(per_t) == 1:
+        return per_t[0], layout.affine
+    n = min(len(levels) for levels in per_t)
+    return [da.stack([levels[k] for levels in per_t]) for k in range(n)], layout.affine
+
+
+def _check_drift(members: list[_Series]) -> None:
+    """Warn when a view's transform changes over time (the first one is used)."""
+    for s in members:
+        ref = s.reference.affine
+        if ref is None:
+            continue
+        for t, v in s.by_time.items():
+            if v.affine is not None and not np.allclose(v.affine, ref, rtol=1e-6, atol=1e-3):
+                _warn(
+                    f"{s.first.label}: affine_to_sample changes over time (first at "
+                    f"timepoint {t}); all timepoints are placed with the first one."
+                )
+                break
+
+
+# --------------------------------------------------------------------------- #
+# Display hints
+# --------------------------------------------------------------------------- #
+
+
+def _pick_colormap(view: _View, index: int, multi: bool) -> Any:
+    """Header color, else a color named by the channel, else a default."""
+    if view.color is not None:
+        return {
+            "colors": [[0.0, 0.0, 0.0, 1.0], [*view.color, 1.0]],
+            "name": f"luxendo-{'-'.join(f'{c:.3g}' for c in view.color)}",
+        }
+    md = view.volume.metadata
+    for text in (md.get("channel_description"), view.group_label, view.label):
+        hint = colormap_from_description(text or "")
+        if hint:
+            return hint
     return _CHANNEL_COLORMAPS[index % len(_CHANNEL_COLORMAPS)] if multi else "gray"
 
 
@@ -193,32 +517,53 @@ def colormap_from_description(text: str) -> str | None:
             return "magenta"
     lower = text.lower()
     for word in _COLOR_WORDS:
-        if re.search(rf"\b{word}\b", lower):
+        if re.search(rf"(?<![a-z]){word}(?![a-z])", lower):
             return word
     return None
 
 
-def _estimate_contrast_limits(volume: LuxVolume) -> list[float] | None:
-    """Robust contrast limits from the coarsest level, or a central plane.
+def _contrast_for(volumes: list[LuxVolume]) -> list[float] | None:
+    """Robust contrast limits pooled over a few views of one channel.
 
-    Avoids napari scanning a full-resolution volume to find its range.
+    Each sampled view contributes its coarsest level when small, otherwise a
+    central block one HDF5 chunk deep, so loading never scans whole volumes.
     """
-    coarsest = volume.levels[-1]
-    try:
-        if coarsest.size <= _CONTRAST_SAMPLE_VOXELS:
-            sample = np.asarray(coarsest)
-        else:
-            data = volume.levels[0]
-            sample = np.asarray(data[data.shape[0] // 2])
-        if sample.size == 0:
-            return None
-        lo, hi = np.percentile(sample, (0.05, 99.95))
-        lo, hi = float(lo), float(hi)
-        if hi <= lo:
-            lo, hi = float(sample.min()), float(sample.max())
-        if hi <= lo:
-            hi = lo + 1.0
-        return [lo, hi]
-    except Exception as exc:
-        logger.debug("Could not estimate contrast limits: %s", exc)
+    if not volumes:
         return None
+    step = max(1, len(volumes) // _CONTRAST_MAX_VIEWS)
+    samples = []
+    for vol in volumes[::step][:_CONTRAST_MAX_VIEWS]:
+        try:
+            samples.append(_sample(vol).ravel())
+        except Exception as exc:
+            logger.debug("Could not sample %s: %s", vol.path, exc)
+    samples = [s for s in samples if s.size]
+    if not samples:
+        return None
+    pooled = np.concatenate(samples)
+    lo, hi = (float(v) for v in np.percentile(pooled, (0.05, 99.95)))
+    if hi <= lo:
+        lo, hi = float(pooled.min()), float(pooled.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    return [lo, hi]
+
+
+def _sample(vol: LuxVolume) -> np.ndarray:
+    k = len(vol.levels) - 1
+    shape = vol.levels[k].shape
+    if int(np.prod(shape)) <= _CONTRAST_SAMPLE_VOXELS:
+        return vol.read(k, tuple(slice(0, n) for n in shape))
+    ds = vol.datasets[k]
+    depth = (ds.chunks[0] if ds.chunks else 1) if ds.ndim == 3 else 1
+    half = int(np.sqrt(_CONTRAST_SAMPLE_VOXELS / depth) // 2)
+    z0 = max(0, shape[0] // 2 - depth // 2)
+    if ds.chunks and ds.ndim == 3:
+        z0 -= z0 % ds.chunks[0]  # align to one HDF5 chunk row
+    cy, cx = shape[1] // 2, shape[2] // 2
+    region = (
+        slice(z0, min(shape[0], z0 + depth)),
+        slice(max(0, cy - half), min(shape[1], cy + half)),
+        slice(max(0, cx - half), min(shape[2], cx + half)),
+    )
+    return vol.read(k, region)

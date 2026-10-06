@@ -13,19 +13,28 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from typing import Any
+
+from ._lux import resolve_link_target
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class HeaderChannel:
-    """One channel of a header: its file per timepoint plus display hints."""
+    """One header entry (an .ims channel or a BDV setup): files per timepoint.
+
+    ``channel`` groups entries that are tiles of the same channel (a BDV
+    setup's ``channel`` attribute); ``name`` is the entry's own label.
+    """
 
     files: list[Path]
     name: str | None = None
     color: tuple[float, float, float] | None = None
+    timepoints: list[int] = field(default_factory=list)
+    channel: str | None = None
+    channel_name: str | None = None
 
 
 @dataclass
@@ -34,21 +43,6 @@ class HeaderInfo:
     kind: str  # "ims" or "bdv"
     channels: list[HeaderChannel] = field(default_factory=list)
     voxel_size_um: tuple[float, float, float] | None = None  # (z, y, x)
-
-
-def _resolve_link_target(header_path: Path, filename: str) -> Path:
-    """Find the file an external link points at.
-
-    Links are normally relative to the header. A link written with an
-    absolute path from the acquisition machine is resolved by its basename
-    next to the header instead.
-    """
-    base = header_path.parent
-    candidate = (base / filename)
-    if candidate.is_file():
-        return candidate
-    leaf = PureWindowsPath(filename).name  # handles both / and \ separators
-    return base / leaf
 
 
 def _text(value: Any) -> str:
@@ -98,7 +92,7 @@ def read_ims_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
             link = _external_link(level0[tp][ch], "Data")
             if link is None:
                 continue
-            per_channel.setdefault(_numeric_suffix(ch), {})[t] = _resolve_link_target(
+            per_channel.setdefault(_numeric_suffix(ch), {})[t] = resolve_link_target(
                 path, link.filename
             )
     if not per_channel:
@@ -106,7 +100,8 @@ def read_ims_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
 
     info = HeaderInfo(path=path, kind="ims")
     for c in sorted(per_channel):
-        files = [per_channel[c][t] for t in sorted(per_channel[c])]
+        tps = sorted(per_channel[c])
+        files = [per_channel[c][t] for t in tps]
         name = color = None
         attrs_grp = h5file.get(f"DataSetInfo/Channel {c}")
         if attrs_grp is not None:
@@ -119,7 +114,12 @@ def read_ims_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
                         color = rgb
                 except ValueError:
                     pass
-        info.channels.append(HeaderChannel(files=files, name=name, color=color))
+        info.channels.append(
+            HeaderChannel(
+                files=files, name=name, color=color, timepoints=tps,
+                channel=str(c), channel_name=name,
+            )
+        )
 
     info.voxel_size_um = _ims_voxel_size(h5file)
     return info
@@ -162,31 +162,51 @@ def read_bdv_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
             link = _external_link(h5file[tp][s]["0"], "cells")
             if link is None:
                 continue
-            per_setup.setdefault(_numeric_suffix(s), {})[t] = _resolve_link_target(
+            per_setup.setdefault(_numeric_suffix(s), {})[t] = resolve_link_target(
                 path, link.filename
             )
     if not per_setup:
         return None
 
-    names, voxel = _read_bdv_xml(path.with_name(path.name[: -len(".h5")] + ".xml"))
-    info = HeaderInfo(path=path, kind="bdv", voxel_size_um=voxel)
+    xml = _read_bdv_xml(path.with_name(path.name[: -len(".h5")] + ".xml"))
+    info = HeaderInfo(path=path, kind="bdv", voxel_size_um=xml.voxel)
     for s in sorted(per_setup):
-        files = [per_setup[s][t] for t in sorted(per_setup[s])]
-        info.channels.append(HeaderChannel(files=files, name=names.get(s)))
+        tps = sorted(per_setup[s])
+        channel = xml.setup_channel.get(s)
+        info.channels.append(
+            HeaderChannel(
+                files=[per_setup[s][t] for t in tps],
+                name=xml.names.get(s),
+                timepoints=tps,
+                channel=channel,
+                channel_name=xml.channel_names.get(channel) if channel is not None else None,
+            )
+        )
     return info
 
 
-def _read_bdv_xml(xml_path: Path) -> tuple[dict[int, str], tuple[float, float, float] | None]:
-    """Return ``({setup_id: name}, voxel_size_zyx)`` from a BDV XML, if present."""
-    names: dict[int, str] = {}
-    voxel = None
+@dataclass
+class _BdvXml:
+    names: dict[int, str] = field(default_factory=dict)  # setup id -> name
+    setup_channel: dict[int, str] = field(default_factory=dict)  # setup id -> channel id
+    channel_names: dict[str, str] = field(default_factory=dict)  # channel id -> name
+    voxel: tuple[float, float, float] | None = None
+
+
+def _read_bdv_xml(xml_path: Path) -> _BdvXml:
+    """Setup names, channel attributes and voxel size from a BDV XML, if present."""
+    out = _BdvXml()
     if not xml_path.is_file():
-        return names, voxel
+        return out
     try:
         root = ET.parse(xml_path).getroot()
     except ET.ParseError as exc:
         logger.warning("Could not parse %s: %s", xml_path.name, exc)
-        return names, voxel
+        return out
+    for ch in root.iter("Channel"):
+        cid, cname = (ch.findtext("id") or "").strip(), (ch.findtext("name") or "").strip()
+        if cid and cname:
+            out.channel_names[cid] = cname
     for vs in root.iter("ViewSetup"):
         try:
             sid = int((vs.findtext("id") or "").strip())
@@ -194,13 +214,16 @@ def _read_bdv_xml(xml_path: Path) -> tuple[dict[int, str], tuple[float, float, f
             continue
         name = (vs.findtext("name") or "").strip()
         if name:
-            names[sid] = name
+            out.names[sid] = name
+        channel = (vs.findtext("attributes/channel") or "").strip()
+        if channel:
+            out.setup_channel[sid] = channel
         size = vs.findtext("voxelSize/size")
-        if voxel is None and size:
+        if out.voxel is None and size:
             try:
                 x, y, z = (float(v) for v in size.split())
                 if x > 0 and y > 0 and z > 0:
-                    voxel = (z, y, x)
+                    out.voxel = (z, y, x)
             except ValueError:
                 pass
-    return names, voxel
+    return out

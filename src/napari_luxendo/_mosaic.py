@@ -176,7 +176,7 @@ def _fill_block(block: np.ndarray, placed: list[_Placed], spacing: np.ndarray,
         z_runs = np.split(z_idx, np.nonzero(np.diff(z_idx) != 1)[0] + 1)
         for i, p in enumerate(hits):
             mask = owner == i
-            if p.vol is None or not mask.any():
+            if p.vol is None or len(p.vol.datasets) <= p.level or not mask.any():
                 continue
             iy = np.nonzero(mask.any(axis=1))[0]
             ix = np.nonzero(mask.any(axis=0))[0]

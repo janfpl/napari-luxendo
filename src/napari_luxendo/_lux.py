@@ -287,6 +287,31 @@ def open_lux_volume(path: Path | str) -> LuxVolume:
     return open_lux_group(f, path)
 
 
+def open_lux_dataset(path: Path | str, dataset_path: str) -> LuxVolume:
+    """Open the Luxendo view whose full-resolution data is *dataset_path* in *path*.
+
+    Headers link to a specific dataset, e.g. ``/Data`` of a flat file or
+    ``/timepoint_0/channel_0/raw_tile/Data`` of a nested one. The view is the
+    group holding that dataset, so its metadata and pyramid levels are the
+    ones next to it, not whatever sits at the file root.
+    """
+    import h5py
+
+    path = Path(path)
+    target = "/" + dataset_path.strip("/")
+    if target.rsplit("/", 1)[-1] != "Data":
+        raise ValueError(f"{path.name}:{target}: expected a link to a Luxendo 'Data' dataset")
+    f = open_h5(path)
+    obj = f.get(target)
+    if not isinstance(obj, h5py.Dataset):
+        raise ValueError(f"{path.name}:{target}: no such dataset")
+    group = obj.parent
+    # The group may live in yet another file (an external link inside path).
+    owner = Path(group.file.filename)
+    view_name = group.name.rsplit("/", 1)[-1] or None
+    return open_lux_group(group, owner, view_name=view_name)
+
+
 def open_lux_group(group: Any, owner_file: Path, view_name: str | None = None) -> LuxVolume:
     """Open the Luxendo view stored in *group* (following external links).
 

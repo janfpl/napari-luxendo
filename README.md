@@ -69,10 +69,12 @@ vol.voxel_size_um   # (z, y, x) or None
 |------|----------------|
 | `main_raw.lux.h5`, `main_processed.lux.h5`, other nested `.lux.h5` | Everything under `timepoint_*/channel_*/<view>/`, following the external links into `raw/` and `processed/` |
 | `*.lux.h5` (flat) | One view: `Data` plus any `Data_W_H_D` levels. Passing several tile / timepoint files in one call (*File > Open Files as Stack…*, or a list from Python) gives a mosaic and time series. Plain *Open Files* opens each file separately. |
-| `*.ims` (Luxendo header) | One entry per channel, following the header's external links. Native Imaris files that store their own pixels are not claimed. |
+| `*.ims` (Luxendo header) | One entry per channel. Each external link is followed to the exact dataset it names, including views inside nested files. Native Imaris files that store their own pixels are not claimed. |
 | BigDataViewer `*.h5` (+ `*.xml`) | One entry per setup. Setups with the same `channel` attribute become one mosaic. |
 
-Any other `.h5` file without Luxendo structure is left to other readers.
+A plain `.h5` file (not named `.lux.h5`) is only claimed if its `metadata`
+holds a Luxendo `processingInformation` block. Any other `.h5` file is left to
+other readers, even if it contains a dataset called `Data`.
 Incomplete `.lux.h5.part` files are never opened.
 
 ### How data is arranged into layers

@@ -35,7 +35,10 @@ import dask.array as da
 import numpy as np
 
 from ._headers import HeaderInfo, read_bdv_header, read_ims_header
-from ._lux import LuxVolume, is_lux_view, open_h5, open_lux_group, open_lux_volume
+from ._lux import (
+    LuxVolume, is_lux_view, open_h5, open_lux_dataset, open_lux_group, open_lux_volume,
+    parse_metadata,
+)
 from ._main import NestedView, is_nested_file, iter_nested_views, timepoint_index
 from ._mosaic import MosaicLayout, build_mosaic_levels, plan_layout, same_linear
 
@@ -71,7 +74,11 @@ def _classify(path: Path) -> str | None:
             if name.endswith(".ims"):
                 return "ims" if read_ims_header(path, f) else None
             if is_lux_view(f):
-                return "lux"
+                # "Data" alone is too common a name: a plain .h5 must also
+                # carry Luxendo metadata. Fall through to the other checks.
+                if _usable_data(f) and (name.endswith(".lux.h5") or _has_luxendo_metadata(f)):
+                    return "lux"
+                return None
             if is_nested_file(f):
                 return "nested"
             if read_bdv_header(path, f):
@@ -79,6 +86,24 @@ def _classify(path: Path) -> str | None:
     except Exception as exc:
         logger.debug("Not a Luxendo file %s: %s", path, exc)
     return None
+
+
+def _usable_data(group: Any) -> bool:
+    import h5py
+
+    data = group.get("Data")
+    return isinstance(data, h5py.Dataset) and data.ndim in (2, 3)
+
+
+def _has_luxendo_metadata(group: Any) -> bool:
+    """True if *group* has a ``metadata`` dataset with a ``processingInformation`` block."""
+    import h5py
+
+    meta = group.get("metadata")
+    if not isinstance(meta, h5py.Dataset):
+        return False
+    raw = parse_metadata(meta).get("raw")
+    return isinstance(raw, dict) and isinstance(raw.get("processingInformation"), dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -135,20 +160,25 @@ def read_luxendo(
     paths = [path] if isinstance(path, (str, Path)) else list(path)
     collected: list[_View] = []
     flat: list[LuxVolume] = []
+    # Timepoints a main file or header lists, even if all their files are
+    # missing, so the time axis keeps its frames in the right places.
+    declared: set[int] = set()
     for p in map(Path, paths):
         kind = _classify(p)
         if kind == "lux":
             flat.append(open_lux_volume(p))
         elif kind == "nested":
-            collected.extend(_views_from_nested(p, views))
+            collected.extend(_views_from_nested(p, views, declared))
         elif kind in ("ims", "bdv"):
-            collected.extend(_views_from_header(_read_header(p, kind)))
+            collected.extend(_views_from_header(_read_header(p, kind), declared))
         else:
             raise ValueError(f"{p.name}: not a Luxendo .lux.h5 file or header")
     collected.extend(_views_from_flat(flat))
     if not collected:
         raise ValueError("No readable Luxendo views found.")
-    return _build_layers(collected, transform=transform, mosaic=tiles == "mosaic")
+    return _build_layers(
+        collected, transform=transform, mosaic=tiles == "mosaic", declared_timepoints=declared
+    )
 
 
 def _warn(message: str) -> None:
@@ -194,7 +224,7 @@ def _views_from_flat(volumes: list[LuxVolume]) -> list[_View]:
     return out
 
 
-def _views_from_nested(path: Path, choice: str) -> list[_View]:
+def _views_from_nested(path: Path, choice: str, declared: set[int]) -> list[_View]:
     f = open_h5(path)
     nested = list(iter_nested_views(f))
     kinds = {v.kind for v in nested}
@@ -204,6 +234,7 @@ def _views_from_nested(path: Path, choice: str) -> list[_View]:
 
     tp_names = sorted({v.timepoint for v in nested}, key=lambda n: timepoint_index(n, 0))
     tp_index = {name: timepoint_index(name, i) for i, name in enumerate(tp_names)}
+    declared.update(tp_index.values())  # after the raw/proc choice, before skipping missing files
     out: list[_View] = []
     missing: list[str] = []
     for nv in nested:
@@ -264,16 +295,18 @@ def _read_header(path: Path, kind: str) -> HeaderInfo:
     return info
 
 
-def _views_from_header(header: HeaderInfo) -> list[_View]:
+def _views_from_header(header: HeaderInfo, declared: set[int]) -> list[_View]:
     out: list[_View] = []
     missing: list[str] = []
     for idx, ch in enumerate(header.channels):
         tps = ch.timepoints or list(range(len(ch.files)))
-        for t, file in zip(tps, ch.files):
+        dataset_paths = ch.dataset_paths or ["/Data"] * len(ch.files)
+        declared.update(tps)
+        for t, file, dataset_path in zip(tps, ch.files, dataset_paths):
             if not file.is_file():
                 missing.append(str(file))
                 continue
-            vol = open_lux_volume(file)
+            vol = open_lux_dataset(file, dataset_path)
             if vol.voxel_size_um is None and header.voxel_size_um:
                 vol.metadata["voxel_size_um"] = header.voxel_size_um
             channel = ch.channel if ch.channel is not None else str(idx)
@@ -319,12 +352,18 @@ class _Series:
         return self.by_time[min(self.by_time)]
 
 
-def _build_layers(views: list[_View], *, transform: str, mosaic: bool) -> list[LayerData]:
+def _build_layers(
+    views: list[_View],
+    *,
+    transform: str,
+    mosaic: bool,
+    declared_timepoints: set[int] | None = None,
+) -> list[LayerData]:
     series: OrderedDict[tuple, _Series] = OrderedDict()
     for v in views:
         s = series.setdefault(v.series, _Series(v.series, {}, v))
         s.by_time[v.timepoint] = v.volume
-    timepoints = sorted({v.timepoint for v in views})
+    timepoints = sorted({v.timepoint for v in views} | set(declared_timepoints or ()))
     use_affine = transform == "sample"
 
     # Group series into layers: one mosaic per channel group (when the tiles
@@ -411,13 +450,53 @@ def _with_time(affine: np.ndarray, has_time: bool) -> np.ndarray:
     return out
 
 
+def _compatible(v: LuxVolume, ref: LuxVolume) -> bool:
+    """True if *v* can stand in for *ref* at another timepoint (same full-res grid)."""
+    return v.shape == ref.shape and v.dtype == ref.dtype
+
+
+def _common_level_count(members: list[_Series]) -> int:
+    """Number of leading pyramid levels every usable timepoint of every series has.
+
+    A level only counts if it has the reference's downsampling factors and
+    shape: equal list positions alone do not mean equal resolution.
+    Timepoints with an incompatible full-resolution grid are shown empty
+    anyway, so they do not restrict the levels.
+    """
+    count = min(len(m.reference.levels) for m in members)
+    for m in members:
+        ref = m.reference
+        for v in m.by_time.values():
+            if not _compatible(v, ref):
+                continue
+            k = 0
+            while (
+                k < count
+                and k < len(v.levels)
+                and tuple(v.factors[k]) == tuple(ref.factors[k])
+                and v.levels[k].shape == ref.levels[k].shape
+            ):
+                k += 1
+            count = k
+    return max(count, 1)
+
+
+def _warn_dropped_levels(label: str, kept: int, available: int) -> None:
+    if kept < available:
+        _warn(
+            f"{label}: pyramid levels differ between timepoints; using only the "
+            f"{kept} level(s) all timepoints share."
+        )
+
+
 def _single_levels(s: _Series, timepoints: list[int]) -> list[da.Array]:
     """Levels of one series, stacked across *timepoints* when there are several."""
     ref = s.reference
     if len(timepoints) == 1:
         return ref.levels
-    n_levels = min(len(v.levels) for v in s.by_time.values())
-    bad = [t for t, v in s.by_time.items() if v.shape != ref.shape or v.dtype != ref.dtype]
+    n_levels = _common_level_count([s])
+    _warn_dropped_levels(s.first.label, n_levels, len(ref.levels))
+    bad = [t for t, v in s.by_time.items() if not _compatible(v, ref)]
     if bad:
         _warn(f"{s.first.label}: timepoint(s) {bad} differ in shape or dtype and are left empty.")
     out = []
@@ -440,13 +519,16 @@ def _mosaic_levels(members: list[_Series], timepoints: list[int]) -> tuple[list[
             "%s: tile positions rounded to the voxel grid (max %.2f voxel).",
             members[0].first.group_label, layout.residual_vx,
         )
+    n_levels = min(len(layout.factors), _common_level_count(members))
+    _warn_dropped_levels(members[0].first.group_label, n_levels, len(layout.factors))
+    layout.factors = layout.factors[:n_levels]
     refs = [m.reference for m in members]
     per_t = []
     for t in timepoints:
         tiles = []
         for m, ref in zip(members, refs):
             v = m.by_time.get(t)
-            if v is not None and (v.shape != ref.shape or v.dtype != ref.dtype):
+            if v is not None and not _compatible(v, ref):
                 _warn(f"{m.first.label}: timepoint {t} has a different shape; left empty.")
                 v = None
             tiles.append(v)

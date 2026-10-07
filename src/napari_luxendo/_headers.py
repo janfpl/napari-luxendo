@@ -33,6 +33,7 @@ class HeaderChannel:
     name: str | None = None
     color: tuple[float, float, float] | None = None
     timepoints: list[int] = field(default_factory=list)
+    dataset_paths: list[str] = field(default_factory=list)  # link target inside each file
     channel: str | None = None
     channel_name: str | None = None
 
@@ -83,7 +84,7 @@ def read_ims_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
     timepoints = sorted(
         (k for k in level0.keys() if k.startswith("TimePoint")), key=_numeric_suffix
     )
-    per_channel: dict[int, dict[int, Path]] = {}
+    per_channel: dict[int, dict[int, tuple[Path, str]]] = {}
     for tp in timepoints:
         t = _numeric_suffix(tp)
         for ch in level0[tp].keys():
@@ -92,8 +93,8 @@ def read_ims_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
             link = _external_link(level0[tp][ch], "Data")
             if link is None:
                 continue
-            per_channel.setdefault(_numeric_suffix(ch), {})[t] = resolve_link_target(
-                path, link.filename
+            per_channel.setdefault(_numeric_suffix(ch), {})[t] = (
+                resolve_link_target(path, link.filename), link.path
             )
     if not per_channel:
         return None
@@ -101,7 +102,8 @@ def read_ims_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
     info = HeaderInfo(path=path, kind="ims")
     for c in sorted(per_channel):
         tps = sorted(per_channel[c])
-        files = [per_channel[c][t] for t in tps]
+        files = [per_channel[c][t][0] for t in tps]
+        dataset_paths = [per_channel[c][t][1] for t in tps]
         name = color = None
         attrs_grp = h5file.get(f"DataSetInfo/Channel {c}")
         if attrs_grp is not None:
@@ -117,6 +119,7 @@ def read_ims_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
         info.channels.append(
             HeaderChannel(
                 files=files, name=name, color=color, timepoints=tps,
+                dataset_paths=dataset_paths,
                 channel=str(c), channel_name=name,
             )
         )
@@ -153,7 +156,7 @@ def read_bdv_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
     timepoints = sorted(
         (k for k in h5file.keys() if re.fullmatch(r"t\d+", k)), key=_numeric_suffix
     )
-    per_setup: dict[int, dict[int, Path]] = {}
+    per_setup: dict[int, dict[int, tuple[Path, str]]] = {}
     for tp in timepoints:
         t = _numeric_suffix(tp)
         for s in h5file[tp].keys():
@@ -162,8 +165,8 @@ def read_bdv_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
             link = _external_link(h5file[tp][s]["0"], "cells")
             if link is None:
                 continue
-            per_setup.setdefault(_numeric_suffix(s), {})[t] = resolve_link_target(
-                path, link.filename
+            per_setup.setdefault(_numeric_suffix(s), {})[t] = (
+                resolve_link_target(path, link.filename), link.path
             )
     if not per_setup:
         return None
@@ -175,7 +178,8 @@ def read_bdv_header(path: Path | str, h5file: Any) -> HeaderInfo | None:
         channel = xml.setup_channel.get(s)
         info.channels.append(
             HeaderChannel(
-                files=[per_setup[s][t] for t in tps],
+                files=[per_setup[s][t][0] for t in tps],
+                dataset_paths=[per_setup[s][t][1] for t in tps],
                 name=xml.names.get(s),
                 timepoints=tps,
                 channel=channel,

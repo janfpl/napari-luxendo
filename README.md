@@ -102,12 +102,23 @@ matching keyword to `napari_luxendo.read_luxendo(...)`:
 | `NAPARI_LUXENDO_TILES` | `tiles` | `mosaic` (default) or `separate`: one layer per tile. With separate tiles, overlaps blend additively. |
 | `NAPARI_LUXENDO_VIEWS` | `views` | `ask` (default): when a main file has both `raw_*` and `proc_*` views, a dialog asks which to load; outside napari the default is processed. `raw` or `proc` skips the question. |
 
+### Camera coordinates toggle
+
+**Plugins > Luxendo H5 Reader > Luxendo coordinates** opens a dock widget with
+a *Show raw data in camera coordinates* switch. When it's on, every Luxendo
+layer is placed by voxel size only: the raw grid as the camera recorded it, with
+no rotation, flip or stage offset. 2D slices are then the planes the camera
+took, without the "non-orthogonal slicing" warning, but views no longer line up
+with each other. Switch it off to return to sample space. Layers opened while it
+is on follow it. From Python: `napari_luxendo._coordinates.set_coordinates(layer, "camera")`.
+
 ### Things to know
 
 - **Rotated views (multiview / MuVi angles) look right in 3D only.** napari
   can't slice a rotated volume obliquely in 2D. It warns and shows the
   volume's own planes without the rotation. Tile grids with only flips and
-  translations are exact in 2D.
+  translations are exact in 2D. To browse raw planes in 2D, use the
+  [camera coordinates toggle](#camera-coordinates-toggle).
 - **Changing transforms over time.** If a view's `affine_to_sample` changes
   between timepoints (e.g. drift-corrected data), every timepoint is placed
   with the first one and a warning is shown.

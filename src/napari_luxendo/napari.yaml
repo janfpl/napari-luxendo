@@ -5,6 +5,12 @@ contributions:
     - id: napari-luxendo.get_reader
       python_name: napari_luxendo._reader:napari_get_reader
       title: Open Luxendo .lux.h5 data
+    - id: napari-luxendo.coordinates_widget
+      python_name: napari_luxendo._widget:CoordinatesWidget
+      title: Luxendo coordinates
+  widgets:
+    - command: napari-luxendo.coordinates_widget
+      display_name: Luxendo coordinates
   readers:
     - command: napari-luxendo.get_reader
       accepts_directories: false

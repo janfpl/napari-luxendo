@@ -426,6 +426,11 @@ def _build_layers(
                 "pyramid_levels": ref.level_names[: len(levels)],
                 "voxel_size_um": ref.voxel_size_um,
                 "placement": "affine_to_sample" if use_affine and affine is not None else "voxel_size",
+                # Both placements, so the coordinates widget can switch between them.
+                "placements": {
+                    "sample": _with_time(affine, has_time) if affine is not None else None,
+                    "camera": _with_time(camera_affine(affine, ref.voxel_size_um), has_time),
+                },
             },
         }
         if use_affine and affine is not None:
@@ -440,6 +445,22 @@ def _build_layers(
         data = levels if len(levels) > 1 else levels[0]
         layers.append((data, kwargs, "image"))
     return layers
+
+
+def camera_affine(affine: np.ndarray | None, voxel: Any) -> np.ndarray:
+    """4x4 placement of the raw voxel grid as the camera recorded it.
+
+    Only the voxel size is kept: no rotation, flip, shear or offset. The voxel
+    size comes from the column lengths of *affine* when there is one (so it
+    matches the sample placement), else from *voxel*, else 1 um.
+    """
+    if affine is not None:
+        scale = np.linalg.norm(np.asarray(affine, dtype=float)[:3, :3], axis=0)
+    elif voxel:
+        scale = np.asarray(voxel, dtype=float)
+    else:
+        scale = np.ones(3)
+    return np.diag([*scale, 1.0])
 
 
 def _with_time(affine: np.ndarray, has_time: bool) -> np.ndarray:

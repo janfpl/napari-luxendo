@@ -1,4 +1,4 @@
-"""Export panel: write Luxendo layers to ``.lux.h5`` or BigTIFF.
+"""Export panel: write Luxendo layers to ``.lux.h5``, BigTIFF, OME-TIFF or JPEG.
 
 Ported from Shifter's export section. Every ticked Luxendo layer is exported
 as shown (a mosaic as its fused volume), one file per layer and timepoint,
@@ -41,7 +41,19 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from ._export import FORMAT_LUX_H5, FORMAT_TIFF, ExportPlan, plan_export, run_export
+from ._export import (
+    FORMAT_JPEG,
+    FORMAT_LUX_H5,
+    FORMAT_OME_TIFF,
+    FORMAT_TIFF,
+    METADATA_CSV,
+    METADATA_JSON,
+    METADATA_TXT,
+    ExportPlan,
+    jpeg_contrast_limits,
+    plan_export,
+    run_export,
+)
 from ._export_layers import (
     export_source,
     exportable_layers,
@@ -92,7 +104,7 @@ class ExportWorker(QThread):
 
 
 class ExportWidget(QWidget):
-    """Dock widget exporting Luxendo layers to ``.lux.h5`` or BigTIFF."""
+    """Dock widget exporting Luxendo layers to ``.lux.h5``, BigTIFF, OME-TIFF or JPEG."""
 
     def __init__(self, napari_viewer: Any) -> None:
         super().__init__()
@@ -156,9 +168,18 @@ class ExportWidget(QWidget):
         self.combo_format = QComboBox()
         self.combo_format.addItem("Luxendo H5 (.lux.h5)", FORMAT_LUX_H5)
         self.combo_format.addItem("BigTIFF (.tif)", FORMAT_TIFF)
+        self.combo_format.addItem("OME-TIFF (.ome.tif)", FORMAT_OME_TIFF)
+        self.combo_format.addItem("JPEG, one per Z-plane (8-bit)", FORMAT_JPEG)
         self.combo_format.currentIndexChanged.connect(self._on_format_changed)
         form.addRow("Output format:", self.combo_format)
         lay.addLayout(form)
+
+        self.lbl_format_note = QLabel(
+            "JPEG is lossy and 8-bit: each layer is scaled with its current contrast "
+            "limits and written as a folder of grayscale images, one per Z-plane."
+        )
+        self.lbl_format_note.setWordWrap(True)
+        lay.addWidget(self.lbl_format_note)
         return grp
 
     def _build_region_section(self) -> QGroupBox:
@@ -268,6 +289,19 @@ class ExportWidget(QWidget):
         )
         lay.addWidget(self.chk_write_header)
 
+        row_meta = QHBoxLayout()
+        row_meta.addWidget(QLabel("Metadata summary:"))
+        self.combo_metadata = QComboBox()
+        self.combo_metadata.addItem("JSON", METADATA_JSON)
+        self.combo_metadata.addItem("JSON + TXT", METADATA_TXT)
+        self.combo_metadata.addItem("JSON + CSV", METADATA_CSV)
+        self.combo_metadata.setToolTip(
+            "luxendo_export.json is always written. TXT and CSV add a copy with one "
+            "key and value per line."
+        )
+        row_meta.addWidget(self.combo_metadata, 1)
+        lay.addLayout(row_meta)
+
         row_btns = QHBoxLayout()
         self.btn_export = QPushButton("Export")
         self.btn_export.clicked.connect(self._on_export)
@@ -357,6 +391,7 @@ class ExportWidget(QWidget):
         is_h5 = self._format() == FORMAT_LUX_H5
         self.chk_write_pyramids.setEnabled(is_h5)
         self.chk_write_header.setEnabled(is_h5)
+        self.lbl_format_note.setVisible(self._format() == FORMAT_JPEG)
 
     def _on_region_changed(self, *_: Any) -> None:
         self.roi_box.setEnabled(self.radio_roi.isChecked())
@@ -458,6 +493,7 @@ class ExportWidget(QWidget):
             timepoint_range=(self.spin_t_first.value(), self.spin_t_last.value()),
             write_pyramids=self.chk_write_pyramids.isChecked(),
             write_header=self.chk_write_header.isChecked(),
+            metadata_format=self.combo_metadata.currentData(),
         )
 
     def _confirm_text(self, plan: ExportPlan) -> str:
@@ -480,7 +516,11 @@ class ExportWidget(QWidget):
             n_files = sum(1 for j in plan.jobs if j.source is src)
             fused = f", fused from {src.fused_views} tiles" if src.fused_views > 1 else ""
             lines.append(f"{src.name}{fused}")
-            lines.append(f"  {region} -> {nx} x {ny} x {nz} (X x Y x Z), {n_files} file(s)")
+            unit = "folder(s) of JPEGs" if plan.fmt == FORMAT_JPEG else "file(s)"
+            lines.append(f"  {region} -> {nx} x {ny} x {nz} (X x Y x Z), {n_files} {unit}")
+            if plan.fmt == FORMAT_JPEG:
+                lo, hi = jpeg_contrast_limits(src)
+                lines.append(f"  8-bit scaling: {lo:g} -> 0, {hi:g} -> 255")
             if plan.fmt == FORMAT_LUX_H5:
                 levels = ", ".join(lvl[0] for lvl in job.levels) or "none"
                 lines.append(f"  pyramid levels: {levels if plan.write_pyramids else 'disabled'}")
@@ -488,9 +528,11 @@ class ExportWidget(QWidget):
             lines.append(f"\nImaris header: {plan.header.name}")
         elif plan.header_note:
             lines.append(f"\nNo Imaris header: {plan.header_note}.")
-        lines.append(
-            f"\n{len(plan.jobs)} file(s), estimated {plan.total_bytes / 1024**3:.2f} GB"
-        )
+        size = f"{plan.total_bytes / 1024**3:.2f} GB"
+        if plan.fmt == FORMAT_JPEG:  # compressed size is unknown until written
+            lines.append(f"\n{len(plan.jobs)} folder(s), at most {size}")
+        else:
+            lines.append(f"\n{len(plan.jobs)} file(s), estimated {size}")
         lines.append(f"RAM allocation: {self.slider_ram.value()}%")
         return "\n".join(lines)
 
@@ -542,7 +584,7 @@ class ExportWidget(QWidget):
             self.list_layers, self.spin_t_first, self.spin_t_last, self.btn_t_current,
             self.combo_format, self.radio_full, self.radio_roi, self.roi_box,
             self.btn_select_outdir, self.edit_outdir, self.slider_ram,
-            self.chk_write_pyramids, self.chk_write_header,
+            self.chk_write_pyramids, self.chk_write_header, self.combo_metadata,
         ):
             w.setEnabled(not running)
         if not running:

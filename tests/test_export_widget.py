@@ -70,3 +70,24 @@ def test_export_runs_in_background(viewer, tmp_path, qtbot, monkeypatch):
     assert shown and "Export finished" in shown[0]
     assert len(list((tmp_path / "out").glob("*_tp-1.lux.h5"))) == 2
     assert not list((tmp_path / "out").glob("*_tp-0.lux.h5"))
+
+
+def test_jpeg_and_metadata_options(viewer, tmp_path):
+    from napari_luxendo._export import FORMAT_JPEG, FORMAT_OME_TIFF
+
+    widget = ExportWidget(viewer)
+    widget.edit_outdir.setText(str(tmp_path / "out"))
+    formats = [widget.combo_format.itemData(i) for i in range(widget.combo_format.count())]
+    assert FORMAT_OME_TIFF in formats and FORMAT_JPEG in formats
+
+    widget.combo_format.setCurrentIndex(formats.index(FORMAT_JPEG))
+    assert not widget.chk_write_pyramids.isEnabled()
+    assert not widget.lbl_format_note.isHidden()
+    widget.combo_metadata.setCurrentIndex(widget.combo_metadata.findData("csv"))
+    plan = widget.build_plan()
+    assert plan.fmt == FORMAT_JPEG and plan.metadata_format == "csv"
+    # Each layer is scaled with the contrast limits it shows.
+    for job in plan.jobs:
+        layer = next(lay for lay in viewer.layers if lay.name == job.source.name)
+        assert job.source.contrast_limits == pytest.approx(tuple(layer.contrast_limits))
+    assert "8-bit scaling" in widget._confirm_text(plan)

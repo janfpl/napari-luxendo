@@ -3,7 +3,8 @@
 A [napari](https://napari.org) reader plugin for Luxendo / Bruker light-sheet
 [Luxendo Image](https://github.com/Luxendo/luxendo-image) (`.lux.h5`) data:
 single volumes, tiled acquisitions, multiview and time series, plus an
-[export panel](#export) that writes layers back to `.lux.h5` or BigTIFF.
+[export panel](#export) that writes layers back to `.lux.h5`, BigTIFF,
+OME-TIFF or JPEG.
 
 - **Lazy loading.** Volumes are opened as dask arrays, so napari reads only
   what you view, even for multi-hundred-GB experiments.
@@ -114,14 +115,30 @@ is on follow it. From Python: `napari_luxendo._coordinates.set_coordinates(layer
 
 ### Export
 
-**Plugins > Luxendo H5 Reader > Export (.lux.h5 / BigTIFF)** writes Luxendo
-layers to disk, one file per layer and timepoint
-(`<layer name>_tp-<t>.lux.h5` or `.tif`):
+**Plugins > Luxendo H5 Reader > Export (.lux.h5 / TIFF / JPEG)** writes
+Luxendo layers to disk, one output per layer and timepoint, named
+`<layer name>_tp-<t>` plus the format's extension:
+
+| Format | Output | What it keeps |
+|--------|--------|---------------|
+| Luxendo H5 | `.lux.h5` | Pixels, pyramid levels and the Luxendo metadata, so it reopens in place (see below) |
+| BigTIFF | `.tif`, one page per Z-plane | Pixels only |
+| OME-TIFF | `.ome.tif`, one page per Z-plane (BigTIFF) | Pixels, plus OME-XML with the layer name, voxel size in µm and channel colour. Opens with physical units in Fiji/Bio-Formats, QuPath and other OME readers. The sample-space placement is not stored. |
+| JPEG | A folder holding `z0000.jpg`, `z0001.jpg`, … | One 8-bit grayscale image per Z-plane, for slides and quick sharing. Lossy (quality 95). |
+
+JPEG scales each layer to 8 bits with the contrast limits it has in napari
+(the lower limit becomes 0, the upper 255, values outside are clipped), so the
+images look like the viewer. Set the contrast before exporting. To get a single
+image, export an ROI one slice deep. JPEG can't hold images wider or higher
+than 65,500 pixels; export an ROI of a larger mosaic.
+
+Options:
 
 - **Layers**: tick the layers to export (all by default). A mosaic is written
   as its fused volume, exactly as shown, with seams midway through the overlaps.
 - **Timepoints**: a range of timepoints, or *Current* for the one on the time
   slider.
+- **Output format**: one of the formats above.
 - **Export region**: the full volume, or a box in world coordinates (µm, as
   shown in the viewer). *Draw ROI rectangle* sets Y/X from a rectangle, the
   *Z min/max = current slice* buttons set Z, and all six bounds can be typed.
@@ -133,13 +150,19 @@ layers to disk, one file per layer and timepoint
 - **Imaris header** (`.lux.h5` only): `luxendo_export.ims` links every exported
   layer (as a channel) and timepoint. It needs all layers to export at the same
   size.
+- **Metadata summary**: `luxendo_export.json` (layers, source files, ROI,
+  outputs, pyramid levels, export date) is always written. *JSON + TXT* or
+  *JSON + CSV* adds `luxendo_export.txt` / `.csv`, the same content with one
+  entry per line: dotted keys such as `layers.0.outputs.1.file`, written as
+  `key: value` (TXT) or as `key,value` rows under a header (CSV). From Python,
+  `napari_luxendo._export.convert_json_metadata(path, "csv")` converts any
+  JSON file the same way.
 
 An exported `.lux.h5` holds `Data`, the pyramid levels and the source's JSON
 metadata with `image_size_vx`, `time_point` and `affine_to_sample` rewritten
-for the exported grid, so it opens in the same place in sample space. A
-`luxendo_export.json` summary is written alongside. The RAM slider sets the
-share of available memory a Z-slab may use. The output directory must not
-hold the source files.
+for the exported grid, so it opens in the same place in sample space. The
+RAM slider sets the share of available memory a Z-slab may use. The output
+directory must not hold the source files.
 
 ### Things to know
 

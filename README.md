@@ -2,8 +2,8 @@
 
 A [napari](https://napari.org) reader plugin for Luxendo / Bruker light-sheet
 [Luxendo Image](https://github.com/Luxendo/luxendo-image) (`.lux.h5`) data:
-single volumes, tiled acquisitions, multiview and time series. It reads data
-only: there are no widgets, no processing and no writer.
+single volumes, tiled acquisitions, multiview and time series, plus an
+[export panel](#export) that writes layers back to `.lux.h5` or BigTIFF.
 
 - **Lazy loading.** Volumes are opened as dask arrays, so napari reads only
   what you view, even for multi-hundred-GB experiments.
@@ -112,6 +112,35 @@ took, without the "non-orthogonal slicing" warning, but views no longer line up
 with each other. Switch it off to return to sample space. Layers opened while it
 is on follow it. From Python: `napari_luxendo._coordinates.set_coordinates(layer, "camera")`.
 
+### Export
+
+**Plugins > Luxendo H5 Reader > Export (.lux.h5 / BigTIFF)** writes Luxendo
+layers to disk, one file per layer and timepoint
+(`<layer name>_tp-<t>.lux.h5` or `.tif`):
+
+- **Layers**: tick the layers to export (all by default). A mosaic is written
+  as its fused volume, exactly as shown, with seams midway through the overlaps.
+- **Timepoints**: a range of timepoints, or *Current* for the one on the time
+  slider.
+- **Export region**: the full volume, or a box in world coordinates (µm, as
+  shown in the viewer). *Draw ROI rectangle* sets Y/X from a rectangle, the
+  *Z min/max = current slice* buttons set Z, and all six bounds can be typed.
+  Each layer exports the voxels of its own grid whose centres lie in the box
+  (for a rotated view, the voxel bounding box of the region).
+- **Pyramid layers** (`.lux.h5` only): regenerate the layer's `Data_W_H_D`
+  levels while writing, or untick for the fastest export. Install
+  `numba` for a multi-threaded reduction.
+- **Imaris header** (`.lux.h5` only): `luxendo_export.ims` links every exported
+  layer (as a channel) and timepoint. It needs all layers to export at the same
+  size.
+
+An exported `.lux.h5` holds `Data`, the pyramid levels and the source's JSON
+metadata with `image_size_vx`, `time_point` and `affine_to_sample` rewritten
+for the exported grid, so it opens in the same place in sample space. A
+`luxendo_export.json` summary is written alongside. The RAM slider sets the
+share of available memory a Z-slab may use. The output directory must not
+hold the source files.
+
 ### Things to know
 
 - **Rotated views (multiview / MuVi angles) look right in 3D only.** napari
@@ -144,6 +173,8 @@ is on follow it. From Python: `napari_luxendo._coordinates.set_coordinates(layer
 ```bash
 pip install -e ".[testing]" napari
 pytest
+# the export widget tests also need a Qt binding and pytest-qt:
+pip install pyqt5 pytest-qt
 ```
 
 ## License

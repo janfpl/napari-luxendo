@@ -50,9 +50,9 @@ def test_single_level_without_metadata(tmp_path):
     assert kwargs["colormap"] == "gray"
 
 
-def test_dask_chunks_follow_hdf5_z_chunks(tmp_path):
+def test_dask_reads_single_planes_even_with_deep_hdf5_chunks(tmp_path):
     vol = open_lux_volume(write_lux(tmp_path / "a.lux.h5", make_volume(0)))
-    assert vol.data.chunks[0][0] == 8
+    assert vol.data.chunks[0][0] == 1
     assert vol.data.chunks[1:] == ((SHAPE[1],), (SHAPE[2],))
 
 

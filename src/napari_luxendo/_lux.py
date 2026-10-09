@@ -17,12 +17,15 @@ import json
 import logging
 import re
 import threading
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import dask.array as da
 import numpy as np
+
+from ._fastio import close_readers, reader_for
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +58,7 @@ def close_all() -> None:
     Any layer still backed by those files will fail to read afterwards, so
     only call this once the layers are gone.
     """
+    close_readers()
     with _OPEN_LOCK:
         for f in _OPEN_FILES.values():
             try:
@@ -214,15 +218,12 @@ def detect_pyramid_levels(group: Any) -> list[tuple[str, int, int, int]]:
 
 
 def _as_dask(ds: Any) -> da.Array:
-    """Wrap an h5py dataset as a dask array chunked in whole XY planes.
-
-    The Z chunk follows the HDF5 chunking so viewing one plane only reads the
-    HDF5 chunks that intersect it.
-    """
-    z_chunk = ds.chunks[0] if ds.chunks else 1
+    """Expose individual planes; storage chunks must not dictate display reads."""
     if ds.ndim == 2:
         return da.from_array(ds, chunks=(-1, -1))[np.newaxis]
-    return da.from_array(ds, chunks=(z_chunk, -1, -1))
+    return da.from_array(reader_for(ds), chunks=(1, 512, 512),
+                         name='luxendo-data-' + uuid.uuid4().hex,
+                         asarray=False, fancy=False, meta=np.empty((0, 0, 0), dtype=ds.dtype))
 
 
 @dataclass
@@ -268,7 +269,7 @@ class LuxVolume:
         ds = self.datasets[level]
         if ds.ndim == 2:
             return np.asarray(ds[region[1], region[2]])[np.newaxis][region[0]]
-        return np.asarray(ds[region])
+        return reader_for(ds)[region]
 
 
 def _strip_ext(name: str) -> str:

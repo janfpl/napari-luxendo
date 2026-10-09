@@ -41,6 +41,7 @@ from ._lux import (
 )
 from ._main import NestedView, is_nested_file, iter_nested_views, timepoint_index
 from ._mosaic import MosaicLayout, build_mosaic_levels, plan_layout, same_linear
+from ._preview import VolumeSource, preview_levels
 
 logger = logging.getLogger(__name__)
 
@@ -402,10 +403,11 @@ def _build_layers(
     for members in plans:
         first = members[0].first
         if len(members) == 1:
-            levels, affine = _single_levels(members[0], timepoints), members[0].reference.affine
+            levels, native_count = _single_levels(members[0], timepoints)
+            affine = members[0].reference.affine
             name = first.label
         else:
-            levels, affine = _mosaic_levels(members, timepoints)
+            levels, affine, native_count = _mosaic_levels(members, timepoints)
             name = f"{first.group_label} mosaic ({len(members)} tiles)"
         _check_drift(members)
 
@@ -423,7 +425,7 @@ def _build_layers(
                 "files": sorted({str(v.path) for s in members for v in s.by_time.values()}),
                 "views": [s.reference.view_name or s.reference.path.name for s in members],
                 "timepoints": timepoints,
-                "pyramid_levels": ref.level_names[: len(levels)],
+                "pyramid_levels": ref.level_names[:native_count],
                 "voxel_size_um": ref.voxel_size_um,
                 "placement": "affine_to_sample" if use_affine and affine is not None else "voxel_size",
                 # Both placements, so the coordinates widget can switch between them.
@@ -443,6 +445,11 @@ def _build_layers(
             kwargs["contrast_limits"] = limits[first.color_key]
 
         data = levels if len(levels) > 1 else levels[0]
+        native_levels = len(kwargs['metadata']['pyramid_levels'])
+        if len(levels) > native_levels:
+            kwargs['metadata']['pyramid_levels'].extend(
+                f'preview_nearest_{k}' for k in range(native_levels, len(levels)))
+            kwargs['metadata']['display_pyramid'] = 'lazy nearest-neighbour preview; level 0 is full resolution'
         layers.append((data, kwargs, "image"))
     return layers
 
@@ -510,11 +517,12 @@ def _warn_dropped_levels(label: str, kept: int, available: int) -> None:
         )
 
 
-def _single_levels(s: _Series, timepoints: list[int]) -> list[da.Array]:
-    """Levels of one series, stacked across *timepoints* when there are several."""
+def _single_levels(s: _Series, timepoints: list[int]) -> tuple[list[da.Array], int]:
+    """Display levels and native level count, stacked across timepoints."""
     ref = s.reference
     if len(timepoints) == 1:
-        return ref.levels
+        return (ref.levels + (preview_levels(VolumeSource(ref)) if len(ref.levels) == 1 else []),
+                len(ref.levels))
     n_levels = _common_level_count([s])
     _warn_dropped_levels(s.first.label, n_levels, len(ref.levels))
     bad = [t for t, v in s.by_time.items() if not _compatible(v, ref)]
@@ -530,10 +538,18 @@ def _single_levels(s: _Series, timepoints: list[int]) -> list[da.Array]:
             else:
                 frames.append(v.levels[k])
         out.append(da.stack(frames))
-    return out
+    if n_levels == 1:
+        reference_previews = preview_levels(VolumeSource(ref))
+        per_t = []
+        for t in timepoints:
+            v = s.by_time.get(t)
+            per_t.append([da.zeros_like(a) for a in reference_previews]
+                         if v is None or t in bad else preview_levels(VolumeSource(v)))
+        out.extend(da.stack([frame[k] for frame in per_t]) for k in range(len(reference_previews)))
+    return out, n_levels
 
 
-def _mosaic_levels(members: list[_Series], timepoints: list[int]) -> tuple[list[da.Array], np.ndarray]:
+def _mosaic_levels(members: list[_Series], timepoints: list[int]) -> tuple[list[da.Array], np.ndarray, int]:
     layout: MosaicLayout = plan_layout([m.reference for m in members])
     if layout.residual_vx > 0.05:
         logger.info(
@@ -555,9 +571,9 @@ def _mosaic_levels(members: list[_Series], timepoints: list[int]) -> tuple[list[
             tiles.append(v)
         per_t.append(build_mosaic_levels(layout, refs, tiles))
     if len(per_t) == 1:
-        return per_t[0], layout.affine
+        return per_t[0], layout.affine, n_levels
     n = min(len(levels) for levels in per_t)
-    return [da.stack([levels[k] for levels in per_t]) for k in range(n)], layout.affine
+    return [da.stack([levels[k] for levels in per_t]) for k in range(n)], layout.affine, n_levels
 
 
 def _check_drift(members: list[_Series]) -> None:

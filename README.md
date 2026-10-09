@@ -176,11 +176,19 @@ directory must not hold the source files.
   with the first one and a warning is shown.
 - **Missing files** (moved, or not yet copied) are skipped with a warning.
   Their region stays empty.
-- **Performance without pyramids.** Raw tiles are often stored without
-  `Data_2_2_2` etc., and are chunked 64×64×64. Showing one plane then reads
-  64 planes of every tile it covers, and the whole-mosaic 3D view reads
-  everything. Generating pyramids, e.g. in the Luxendo Image Processor, makes
-  large mosaics much faster to browse.
+- **Performance without pyramids.** Large raw datasets get lazy display
+  overviews automatically. Opening needs no preprocessing or sidecar files;
+  zooming selects finer levels and level zero retains the original pixels.
+  Overviews use nearest-neighbour sampling, so small features may disappear
+  when zoomed out. Precomputed averaged pyramids remain preferable for
+  high-quality overview and 3D work. The initial view is a 2D slice; opening
+  a 3D overview can still require substantial disk access.
+  `NAPARI_LUXENDO_PREVIEW=0` disables generated display levels.
+- **Reading raw chunks.** Display requests read individual planes and crops.
+  Uncompressed standard numeric HDF5 chunks use a read-only memory mapping,
+  with every physical address obtained from the actual HDF5 chunk index.
+  Compressed and unsupported layouts use h5py. No offsets are guessed from
+  file order. `NAPARI_LUXENDO_DIRECT_IO=0` forces h5py for troubleshooting.
 - **Contrast.** Initial contrast limits are the 0.05–99.95 percentiles of a
   small central block from up to six views of each channel, so loading never
   scans whole volumes.
@@ -199,6 +207,10 @@ pytest
 # the export widget tests also need a Qt binding and pytest-qt:
 pip install pyqt5 pytest-qt
 ```
+
+`benchmarks/synthetic_benchmark.py` generates a raw mosaic without pyramids
+and times opening, the first slice, a Z step and full-resolution reads;
+`--source` points it at another checkout's `src` to compare.
 
 ## License
 

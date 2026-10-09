@@ -19,6 +19,7 @@ level:
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -26,10 +27,11 @@ import dask.array as da
 import numpy as np
 
 from ._lux import LuxVolume
+from ._preview import preview_levels
 
 logger = logging.getLogger(__name__)
 
-# YX block edge of the mosaic dask array (Z follows the tiles' HDF5 chunks).
+# YX block edge of the mosaic dask array. Only requested Z planes are read.
 _BLOCK_YX = 512
 
 
@@ -103,20 +105,42 @@ def build_mosaic_levels(
             for off, ref in zip(layout.offsets, reference)
         ]
         shape = tuple(int(x) for x in np.max([g.stop for g in grid], axis=0))
-        z_chunk = max(1, min(g.vol.levels[k].chunks[0][0] for g in grid))
-        chunks = (min(z_chunk, shape[0]), min(_BLOCK_YX, shape[1]), min(_BLOCK_YX, shape[2]))
+        chunks = (1, min(_BLOCK_YX, shape[1]), min(_BLOCK_YX, shape[2]))
         placed = [
             _Placed(vol, k, g.start, owner_shape=g.stop - g.start)
             for g, vol in zip(grid, tiles)
         ]
-        template = da.zeros(shape, chunks=chunks, dtype=dtype)
+        source = _MosaicSource(shape, dtype, placed, voxel_um * f_arr)
         levels.append(
-            template.map_blocks(
-                _fill_block, placed=placed, spacing=voxel_um * f_arr, dtype=dtype,
-                meta=np.empty((0, 0, 0), dtype=dtype),
+            da.from_array(
+                source, chunks=chunks, name='luxendo-mosaic-' + uuid.uuid4().hex,
+                asarray=False, fancy=False, meta=np.empty((0, 0, 0), dtype=dtype),
             )
         )
+        if len(layout.factors) == 1:
+            levels.extend(preview_levels(source))
     return levels
+
+
+class _MosaicSource:
+    """Sliceable mosaic: Dask can fuse crops into reads without making slabs.
+
+    A compact from_array graph also avoids map_blocks' per-block block_info
+    dictionaries, which become very large for plane-sized Z chunks.
+    """
+
+    ndim = 3
+
+    def __init__(self, shape, dtype, placed, spacing):
+        self.shape = shape
+        self.dtype = np.dtype(dtype)
+        self.placed = placed
+        self.spacing = spacing
+
+    def __getitem__(self, key):
+        # from_array uses positive slice tuples (and empty meta selections).
+        key = tuple(slice(*s.indices(n)) for s, n in zip(key, self.shape))
+        return _fill_region(key, self.dtype, self.placed, self.spacing)
 
 
 class _Placed:
@@ -136,18 +160,32 @@ class _Placed:
         self.center = offset + (shape - 1) / 2.0
 
 
-def _fill_block(block: np.ndarray, placed: list[_Placed], spacing: np.ndarray,
-                block_info=None) -> np.ndarray:
-    (z0, z1), (y0, y1), (x0, x1) = block_info[0]["array-location"]
-    lo, hi = np.array([z0, y0, x0]), np.array([z1, y1, x1])
-    out = np.zeros(block.shape, dtype=block.dtype)
+def _fill_region(key, dtype, placed, spacing):
+    coords = [np.arange(s.start, s.stop, s.step) for s in key]
+    out = np.zeros(tuple(len(c) for c in coords), dtype=dtype)
+    if not out.size:
+        return out
+    lo = np.array([c[0] for c in coords])
+    hi = np.array([c[-1] + 1 for c in coords])
     hits = [p for p in placed if np.all(p.start < hi) and np.all(p.stop > lo)]
     if not hits:
         return out
 
-    ys = np.arange(y0, y1)[:, None]
-    xs = np.arange(x0, x1)[None, :]
-    zs = np.arange(z0, z1)
+    if len(hits) == 1:
+        p = hits[0]
+        if p.vol is not None and len(p.vol.datasets) > p.level:
+            bounds = [(int(np.searchsorted(c, a)), int(np.searchsorted(c, b)))
+                      for c, a, b in zip(coords, p.start, p.stop)]
+            if all(b > a for a, b in bounds):
+                dst = tuple(slice(a, b) for a, b in bounds)
+                src = tuple(slice(int(c[a] - origin), int(c[b-1] - origin + 1), s.step)
+                            for c, (a, b), origin, s in zip(coords, bounds, p.start, key))
+                out[dst] = p.vol.read(p.level, src)
+        return out
+
+    zs, yy, xx = coords
+    ys = yy[:, None]
+    xs = xx[None, :]
 
     # Squared physical distance to each tile centre, split into an in-plane
     # part (Y, X) and a per-plane Z part; infinite where the tile does not
@@ -185,8 +223,8 @@ def _fill_block(block: np.ndarray, placed: list[_Placed], spacing: np.ndarray,
             for run in z_runs:
                 bz = slice(int(run[0]), int(run[-1]) + 1)
                 region = tuple(
-                    slice(int(b.start + l - s), int(b.stop + l - s))
-                    for b, l, s in zip((bz, by, bx), lo, p.start)
+                    slice(int(c[b.start] - origin), int(c[b.stop-1] - origin + 1), s.step)
+                    for b, c, origin, s in zip((bz, by, bx), coords, p.start, key)
                 )
                 data = p.vol.read(p.level, region)
                 out[bz, by, bx][:, sub] = data[:, sub]

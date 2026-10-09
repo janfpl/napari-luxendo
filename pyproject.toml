@@ -22,10 +22,14 @@ dependencies = [
     "numpy>=1.23",
     "dask[array]>=2023.1.0",
     "h5py>=3.7",
+    "psutil>=5.9",
+    "tifffile>=2023.2.3",
 ]
 
 [project.optional-dependencies]
 napari = ["napari[all]>=0.4.18"]
+# Multi-threaded pyramid reduction when exporting .lux.h5 (falls back to numpy).
+numba = ["numba>=0.60"]
 testing = ["pytest>=7.0", "npe2"]
 
 [project.entry-points."napari.manifest"]

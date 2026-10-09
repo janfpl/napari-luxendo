@@ -279,9 +279,10 @@ def plan_export(
 
         stem = safe_filename(src.name)
         base, n = stem, 2
-        while stem in used_stems:
+        # Case-insensitive: Windows and macOS would write "A" and "a" to one file.
+        while stem.casefold() in used_stems:
             stem, n = f"{base}_{n}", n + 1
-        used_stems.add(stem)
+        used_stems.add(stem.casefold())
 
         itemsize = 1 if fmt == FORMAT_JPEG else np.dtype(src.data.dtype).itemsize
         for frame, t in enumerate(src.timepoints):

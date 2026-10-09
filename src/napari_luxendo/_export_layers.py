@@ -110,13 +110,18 @@ def export_source(layer: Any, roi: Optional[Roi] = None) -> ExportSource:
     md = layer.metadata
     placements = md.get("placements") or {}
     voxel = md.get("voxel_size_um")
+    # Without affine_to_sample the layer is placed by voxel size (the camera
+    # placement); writing that keeps a crop's offset.
+    affine = placements.get("sample")
+    if affine is None:
+        affine = placements.get("camera")
     return ExportSource(
         name=layer.name,
         data=full_resolution(layer),
         timepoints=layer_timepoints(layer),
         roi=roi,
         pyramid_levels=[n for n in (md.get("pyramid_levels") or []) if n != "Data"],
-        affine_zyx=_spatial(placements.get("sample")),
+        affine_zyx=_spatial(affine),
         voxel_size_um=tuple(float(v) for v in voxel) if voxel else None,
         metadata=md.get("luxendo") or {},
         color=_color(layer),

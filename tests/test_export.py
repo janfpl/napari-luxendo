@@ -316,6 +316,19 @@ def test_duplicate_layer_names_get_distinct_files(tmp_path):
     assert [j.output.name for j in plan.jobs] == ["a_b_tp-0.lux.h5", "a_b_2_tp-0.lux.h5"]
 
 
+def test_case_only_names_do_not_overwrite(tmp_path):
+    """On Windows and macOS "Green" and "green" would be the same file."""
+    a, b = _source("Green", timepoints=(0,)), _source("green", timepoints=(0,))
+    a.data[:], b.data[:] = 1, 2
+    plan = plan_export([a, b], tmp_path)
+    names = [j.output.name for j in plan.jobs]
+    assert len({n.casefold() for n in names}) == 2, names
+    run_export(plan)
+    for job, value in zip(plan.jobs, (1, 2)):
+        with h5py.File(job.output, "r") as f:
+            assert (f["Data"][()] == value).all()
+
+
 def test_refuses_to_write_next_to_sources(tmp_path):
     src = _source()
     src.source_files = [str(tmp_path / "raw.lux.h5")]
@@ -424,4 +437,25 @@ def test_fused_mosaic_export_reopens_in_place(tiled_experiment, tmp_path):
     assert len(reopened) == 2
     np.testing.assert_array_equal(
         np.asarray(reopened[1][0][0][1]), crop(ground_truth(1, 1), ROI)
+    )
+
+
+def test_crop_without_sample_affine_keeps_origin(tmp_path):
+    """A layer placed by voxel size only: the crop's offset must survive export."""
+    data = np.arange(6 * 8 * 10, dtype=np.uint16).reshape(1, 6, 8, 10)
+    voxel = (2.0, 3.0, 4.0)
+    layer = napari.layers.Image(data, scale=(1.0, *voxel), name="plain", metadata={
+        "voxel_size_um": voxel,
+        "placements": {"sample": None, "camera": np.diag([*voxel, 1.0])},
+    })
+    roi = (1, 6, 2, 8, 3, 10)
+    src = export_source(layer, roi)
+    run_export(plan_export([src], tmp_path, write_pyramids=False))
+
+    vol = open_lux_volume(tmp_path / "plain_tp-0.lux.h5")
+    np.testing.assert_array_equal(np.asarray(vol.data), crop(data[0], roi))
+    np.testing.assert_allclose(vol.affine @ np.r_[0, 0, 0, 1.0], [2.0, 6.0, 12.0, 1.0])
+    # It reopens where it was shown in the viewer.
+    np.testing.assert_allclose(
+        vol.affine[:3, 3], layer.data_to_world([0, 1, 2, 3])[1:]
     )

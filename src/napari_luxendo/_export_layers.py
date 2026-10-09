@@ -97,6 +97,14 @@ def _color(layer: Any) -> Optional[tuple[float, float, float]]:
     return rgb if any(rgb) else None  # type: ignore[return-value]
 
 
+def _contrast_limits(layer: Any) -> Optional[tuple[float, float]]:
+    try:
+        lo, hi = (float(v) for v in layer.contrast_limits)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return (lo, hi)
+
+
 def export_source(layer: Any, roi: Optional[Roi] = None) -> ExportSource:
     """An :class:`ExportSource` for a Luxendo *layer*, cropped to *roi* (voxels)."""
     md = layer.metadata
@@ -112,6 +120,7 @@ def export_source(layer: Any, roi: Optional[Roi] = None) -> ExportSource:
         voxel_size_um=tuple(float(v) for v in voxel) if voxel else None,
         metadata=md.get("luxendo") or {},
         color=_color(layer),
+        contrast_limits=_contrast_limits(layer),
         fused_views=max(1, len(md.get("views") or [])),
         source_files=list(md.get("files") or []),
     )

@@ -22,6 +22,7 @@ dependencies = [
     "numpy>=1.23",
     "dask[array]>=2023.1.0",
     "h5py>=3.7",
+    "pillow>=9.1",
     "psutil>=5.9",
     "tifffile>=2023.2.3",
 ]

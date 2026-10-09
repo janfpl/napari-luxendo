@@ -1,8 +1,10 @@
-"""Exporting Luxendo layers to .lux.h5 / BigTIFF (engine and layer conversion)."""
+"""Exporting Luxendo layers to .lux.h5 / BigTIFF / OME-TIFF / JPEG (engine and layers)."""
 
 from __future__ import annotations
 
+import csv
 import json
+import xml.etree.ElementTree as ET
 
 import h5py
 import numpy as np
@@ -12,11 +14,15 @@ import tifffile
 from napari_luxendo import open_lux_volume, read_luxendo
 from napari_luxendo import _export
 from napari_luxendo._export import (
+    FORMAT_JPEG,
+    FORMAT_OME_TIFF,
     FORMAT_TIFF,
     IMS_FILENAME,
     SUMMARY_FILENAME,
     ExportSource,
     affine_to_luxendo,
+    flatten_json,
+    jpeg_plane_paths,
     plan_export,
     run_export,
 )
@@ -124,6 +130,149 @@ def test_bigtiff_export(tmp_path, small_slabs, roi):
             got = tf.asarray()
         expected = src.data[frame] if roi is None else crop(src.data[frame], roi)
         np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("roi", [None, ROI])
+def test_ome_tiff_export(tmp_path, small_slabs, roi):
+    src = _source(roi=roi)
+    plan = plan_export([src], tmp_path / "out", FORMAT_OME_TIFF)
+    assert plan.header is None and not plan.write_pyramids
+    progress = []
+    run_export(plan, progress_callback=lambda d, t: progress.append((d, t)))
+    assert progress[-1] == (plan.total_bytes, plan.total_bytes)
+
+    for frame, t in enumerate(src.timepoints):
+        with tifffile.TiffFile(tmp_path / "out" / f"Green-488_tp-{t}.ome.tif") as tf:
+            assert tf.is_ome and tf.is_bigtiff
+            assert tf.series[0].axes == "ZYX"
+            got = tf.asarray()
+            ome = ET.fromstring(tf.ome_metadata)
+        expected = src.data[frame] if roi is None else crop(src.data[frame], roi)
+        np.testing.assert_array_equal(got, expected)
+
+        ns = {"ome": ome.tag.split("}")[0][1:]}
+        image = ome.find("ome:Image", ns)
+        pixels = image.find("ome:Pixels", ns)
+        channel = pixels.find("ome:Channel", ns)
+        assert image.get("Name") == channel.get("Name") == "Green-488"
+        assert float(pixels.get("PhysicalSizeX")) == pytest.approx(2.925)
+        assert float(pixels.get("PhysicalSizeZ")) == pytest.approx(5.0)
+        assert pixels.get("PhysicalSizeXUnit") == "µm"
+        assert int(channel.get("Color")) == 0x00FF00FF  # green, opaque
+
+
+def _read_jpegs(paths):
+    from PIL import Image
+
+    planes = []
+    for path in paths:
+        with Image.open(path) as im:
+            assert im.format == "JPEG" and im.mode == "L"
+            planes.append(np.asarray(im))
+    return np.stack(planes)
+
+
+@pytest.mark.parametrize("roi", [None, ROI])
+def test_jpeg_export(tmp_path, small_slabs, roi):
+    src = _source(roi=roi)
+    # A smooth ramp, so JPEG compression error stays small.
+    zz, yy, xx = np.indices(src.shape_zyx)
+    ramp = (1000 + 300 * zz + 40 * yy + 20 * xx).astype(np.uint16)
+    src.data = np.stack([ramp, ramp + 500])
+    src.contrast_limits = (1000.0, 4000.0)
+
+    plan = plan_export([src], tmp_path / "out", FORMAT_JPEG)
+    assert plan.header is None and not plan.write_pyramids
+    nz, ny, nx = src.output_shape
+    assert plan.total_bytes == 2 * nz * ny * nx  # 8-bit, before compression
+    run_export(plan)
+
+    for frame, (job, t) in enumerate(zip(plan.jobs, src.timepoints)):
+        folder = tmp_path / "out" / f"Green-488_tp-{t}"
+        assert job.output == folder
+        assert sorted(p.name for p in folder.iterdir()) == [f"z{z:04d}.jpg" for z in range(nz)]
+        got = _read_jpegs(jpeg_plane_paths(job))
+        vol = src.data[frame] if roi is None else crop(src.data[frame], roi)
+        expected = np.clip((vol.astype(float) - 1000) * 255 / 3000, 0, 255)
+        assert got.shape == expected.shape
+        assert np.abs(got - expected).mean() < 2
+
+    meta = json.loads((tmp_path / "out" / SUMMARY_FILENAME).read_text())
+    assert meta["format"] == "jpeg"
+    assert meta["layers"][0]["contrast_limits"] == [1000.0, 4000.0]
+
+
+def test_jpeg_scaling_defaults_to_dtype_range(tmp_path):
+    src = _source(timepoints=(0,), shape=(2, 16, 16))
+    src.data[:] = 65535
+    src.data[0, 0] = 0
+    run_export(plan_export([src], tmp_path, FORMAT_JPEG))
+    got = _read_jpegs(sorted((tmp_path / "Green-488_tp-0").glob("*.jpg")))
+    assert got[0].max() < 5 and got[1].min() > 250
+
+
+def test_jpeg_overwrite_removes_stale_planes(tmp_path):
+    folder = tmp_path / "Green-488_tp-0"
+    folder.mkdir()
+    (folder / "z0099.jpg").write_bytes(b"old")
+    (folder / "notes.txt").write_text("keep me")
+    run_export(plan_export([_source(timepoints=(0,), shape=(3, 8, 8))], tmp_path, FORMAT_JPEG))
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "notes.txt", "z0000.jpg", "z0001.jpg", "z0002.jpg"
+    ]
+
+
+def test_jpeg_cancel_removes_partial_folder(tmp_path, small_slabs):
+    plan = plan_export([_source()], tmp_path, FORMAT_JPEG)
+    calls = iter([False] * 2)
+    assert run_export(plan, cancel_check=lambda: next(calls, True)) is None
+    assert not (tmp_path / "Green-488_tp-0").exists()
+
+
+def test_ome_tiff_cancel_removes_partial_file(tmp_path, small_slabs):
+    plan = plan_export([_source()], tmp_path, FORMAT_OME_TIFF)
+    slabs_per_file = -(-13 // 3)
+    calls = iter([False] * (slabs_per_file + 1))
+    assert run_export(plan, cancel_check=lambda: next(calls, True)) is None
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["Green-488_tp-0.ome.tif"]
+
+
+def test_jpeg_refuses_oversized_planes(tmp_path):
+    src = _source(timepoints=(0,), shape=(1, 2, 70000))
+    with pytest.raises(ValueError, match="at most 65500 pixels"):
+        plan_export([src], tmp_path, FORMAT_JPEG)
+
+
+def test_flatten_json():
+    rows = flatten_json({"a": {"b": [1, {"c": "x"}]}, "e": [], "n": None, "t": True})
+    assert rows == [("a.b.0", "1"), ("a.b.1.c", "x"), ("e", "[]"), ("n", ""), ("t", "true")]
+
+
+@pytest.mark.parametrize("fmt", ["txt", "csv"])
+def test_metadata_summary_as_txt_or_csv(tmp_path, fmt):
+    plan = plan_export([_source()], tmp_path, FORMAT_TIFF, metadata_format=fmt)
+    extra = tmp_path / f"luxendo_export.{fmt}"
+    assert extra in plan.output_paths
+    summary = run_export(plan)
+    assert summary.exists() and extra.exists()
+
+    expected = flatten_json(json.loads(summary.read_text()))
+    text = extra.read_text(encoding="utf-8")
+    if fmt == "csv":
+        rows = list(csv.reader(text.splitlines()))
+        assert rows[0] == ["key", "value"]
+        assert [tuple(r) for r in rows[1:]] == expected
+    else:
+        assert text.splitlines() == [f"{k}: {v}" for k, v in expected]
+    assert ("layers.0.outputs.1.file", "Green-488_tp-1.tif") in expected
+
+
+def test_json_only_metadata_by_default(tmp_path):
+    run_export(plan_export([_source()], tmp_path, FORMAT_TIFF))
+    assert not list(tmp_path.glob("luxendo_export.txt"))
+    assert not list(tmp_path.glob("luxendo_export.csv"))
+    with pytest.raises(ValueError, match="metadata format"):
+        plan_export([_source()], tmp_path, metadata_format="xml")
 
 
 def test_no_pyramids(tmp_path):

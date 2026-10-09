@@ -1,4 +1,4 @@
-"""Export Luxendo layers to ``.lux.h5`` or BigTIFF.
+"""Export Luxendo layers to ``.lux.h5``, BigTIFF, OME-TIFF or JPEG.
 
 Ported from Shifter's exporter. Each source is the full-resolution lazy array
 of a layer (a single view, or a stitched mosaic), so what is written is what
@@ -9,7 +9,11 @@ optionally cropped to a voxel ROI, and written as either
   levels (optional), and the source's JSON ``metadata`` with
   ``image_size_vx``, ``time_point`` and ``affine_to_sample`` rewritten for the
   exported grid, so the file reopens in the right place in sample space; or
-* a BigTIFF with one page per Z-plane.
+* a BigTIFF with one page per Z-plane;
+* an OME-TIFF (BigTIFF with OME-XML) with one page per Z-plane, carrying the
+  voxel size, layer name and colour; or
+* a folder of 8-bit JPEGs, one per Z-plane, scaled with the layer's contrast
+  limits.
 
 For ``.lux.h5`` an Imaris ``.ims`` header linking every exported channel and
 timepoint can be written alongside.
@@ -41,8 +45,23 @@ logger = logging.getLogger(__name__)
 
 FORMAT_LUX_H5 = "lux.h5"
 FORMAT_TIFF = "tiff"
+FORMAT_OME_TIFF = "ome.tiff"
+FORMAT_JPEG = "jpeg"
+FORMATS = (FORMAT_LUX_H5, FORMAT_TIFF, FORMAT_OME_TIFF, FORMAT_JPEG)
+_EXTENSIONS = {
+    FORMAT_LUX_H5: ".lux.h5",
+    FORMAT_TIFF: ".tif",
+    FORMAT_OME_TIFF: ".ome.tif",
+    FORMAT_JPEG: "",  # a folder of planes
+}
 
 SUMMARY_FILENAME = "luxendo_export.json"
+
+# Extra copies of the JSON summary, flattened to one ``key, value`` per line.
+METADATA_JSON = "json"  # the JSON summary only
+METADATA_TXT = "txt"
+METADATA_CSV = "csv"
+METADATA_FORMATS = (METADATA_JSON, METADATA_TXT, METADATA_CSV)
 IMS_FILENAME = "luxendo_export.ims"
 
 # (z_start, z_stop, y_start, y_stop, x_start, x_stop) in voxels, stops exclusive.
@@ -52,6 +71,10 @@ CancelCheck = Callable[[], bool]
 
 # Default chunk edge of exported HDF5 datasets (Luxendo writes 64^3).
 _H5_CHUNK = 64
+
+JPEG_QUALITY = 95
+# Largest width or height a baseline JPEG can hold.
+_JPEG_MAX_EDGE = 65500
 
 # --- Chunk-size policy ----------------------------------------------------- #
 # Reading a slab and writing it (plus the pyramid working buffers) transiently
@@ -97,6 +120,7 @@ class ExportSource:
     voxel_size_um: Optional[tuple[float, float, float]] = None  # (z, y, x)
     metadata: dict[str, Any] = field(default_factory=dict)  # Luxendo JSON of the reference view
     color: Optional[tuple[float, float, float]] = None
+    contrast_limits: Optional[tuple[float, float]] = None  # 8-bit scaling for JPEG
     fused_views: int = 1  # number of tiles stitched into the data
     source_files: list[str] = field(default_factory=list)
 
@@ -138,6 +162,7 @@ class ExportPlan:
     jobs: list[ExportJob]
     header: Optional[Path] = None  # .ims to write, if any
     header_note: str = ""  # why no header is written, when one was asked for
+    metadata_format: str = METADATA_JSON  # extra TXT / CSV copy of the summary
 
     @property
     def total_bytes(self) -> int:
@@ -148,7 +173,10 @@ class ExportPlan:
         paths = [job.output for job in self.jobs]
         if self.header is not None:
             paths.append(self.header)
-        return paths + [self.output_dir / SUMMARY_FILENAME]
+        paths.append(self.output_dir / SUMMARY_FILENAME)
+        if self.metadata_format != METADATA_JSON:
+            paths.append(paths[-1].with_suffix(f".{self.metadata_format}"))
+        return paths
 
 
 def safe_filename(name: str) -> str:
@@ -192,6 +220,7 @@ def plan_export(
     timepoint_range: Optional[tuple[int, int]] = None,
     write_pyramids: bool = True,
     write_header: bool = True,
+    metadata_format: str = METADATA_JSON,
 ) -> ExportPlan:
     """Validate an export request and list the files it will write.
 
@@ -206,8 +235,10 @@ def plan_export(
         For an unknown format, an ROI outside a volume, no timepoint in range,
         non-uint16 data with pyramids, or an output directory holding a source.
     """
-    if fmt not in (FORMAT_LUX_H5, FORMAT_TIFF):
+    if fmt not in FORMATS:
         raise ValueError(f"Unknown export format: {fmt!r}")
+    if metadata_format not in METADATA_FORMATS:
+        raise ValueError(f"Unknown metadata format: {metadata_format!r}")
     if not sources:
         raise ValueError("No layers selected for export.")
 
@@ -223,7 +254,7 @@ def plan_export(
                     )
 
     pyramids = write_pyramids and fmt == FORMAT_LUX_H5
-    ext = ".lux.h5" if fmt == FORMAT_LUX_H5 else ".tif"
+    ext = _EXTENSIONS[fmt]
     jobs: list[ExportJob] = []
     used_stems: set[str] = set()
     for src in sources:
@@ -239,13 +270,20 @@ def plan_export(
                 f"{src.data.dtype}. Disable pyramid layers to export it."
             )
 
+        if fmt == FORMAT_JPEG and max(out_shape[1:]) > _JPEG_MAX_EDGE:
+            raise ValueError(
+                f"{src.name}: JPEG images can be at most {_JPEG_MAX_EDGE} pixels wide or high, "
+                f"but this export is {out_shape[2]} x {out_shape[1]}. Export an ROI or "
+                "choose another format."
+            )
+
         stem = safe_filename(src.name)
         base, n = stem, 2
         while stem in used_stems:
             stem, n = f"{base}_{n}", n + 1
         used_stems.add(stem)
 
-        itemsize = np.dtype(src.data.dtype).itemsize
+        itemsize = 1 if fmt == FORMAT_JPEG else np.dtype(src.data.dtype).itemsize
         for frame, t in enumerate(src.timepoints):
             if timepoint_range is not None and not timepoint_range[0] <= t <= timepoint_range[1]:
                 continue
@@ -260,7 +298,8 @@ def plan_export(
     if not jobs:
         raise ValueError("No timepoint of the selected layers is in the chosen range.")
 
-    plan = ExportPlan(fmt=fmt, output_dir=output_dir, write_pyramids=pyramids, jobs=jobs)
+    plan = ExportPlan(fmt=fmt, output_dir=output_dir, write_pyramids=pyramids, jobs=jobs,
+                      metadata_format=metadata_format)
     if fmt == FORMAT_LUX_H5 and write_header:
         plan.header_note = _ims_header_problem(plan)
         if not plan.header_note:
@@ -363,6 +402,107 @@ def _write_tiff(job: ExportJob, chunk_z: int, progress: ProgressCallback,
             progress(done, job.output_bytes)
 
 
+def _ome_color(rgb: tuple[float, float, float]) -> int:
+    """OME ``Channel/@Color``: RGBA packed into a signed 32-bit integer."""
+    r, g, b = (int(round(min(max(v, 0.0), 1.0) * 255)) for v in rgb)
+    return int(np.array((r << 24) | (g << 16) | (b << 8) | 255, dtype=np.uint32).view(np.int32))
+
+
+def ome_metadata(source: ExportSource) -> dict[str, Any]:
+    """tifffile OME metadata for *source*: axes, name, voxel size and colour."""
+    meta: dict[str, Any] = {"axes": "ZYX", "Name": source.name}
+    if source.voxel_size_um:
+        for axis, size in zip("ZYX", source.voxel_size_um):
+            meta[f"PhysicalSize{axis}"] = float(size)
+            meta[f"PhysicalSize{axis}Unit"] = "µm"
+    channel: dict[str, Any] = {"Name": source.name}
+    if source.color is not None:
+        channel["Color"] = _ome_color(source.color)
+    meta["Channel"] = channel
+    return meta
+
+
+def _write_ome_tiff(job: ExportJob, chunk_z: int, progress: ProgressCallback,
+                    cancel_check: Optional[CancelCheck]) -> None:
+    import tifffile
+
+    def planes():
+        done = 0
+        for _start, slab in _iter_slabs(job, chunk_z, cancel_check):
+            yield from slab
+            done += slab.nbytes
+            progress(done, job.output_bytes)
+
+    with tifffile.TiffWriter(str(job.output), bigtiff=True, ome=True) as tw:
+        tw.write(
+            planes(), shape=job.output_shape, dtype=job.source.data.dtype,
+            photometric="minisblack", metadata=ome_metadata(job.source),
+        )
+
+
+def jpeg_contrast_limits(source: ExportSource) -> tuple[float, float]:
+    """Intensities mapped to 0 and 255 in a JPEG export of *source*."""
+    if source.contrast_limits is not None:
+        lo, hi = (float(v) for v in source.contrast_limits)
+    else:
+        dtype = np.dtype(source.data.dtype)
+        lo, hi = (float(np.iinfo(dtype).min), float(np.iinfo(dtype).max)) \
+            if dtype.kind in "ui" else (0.0, 1.0)
+    return lo, hi if hi > lo else lo + 1.0
+
+
+def to_uint8(plane: np.ndarray, limits: tuple[float, float]) -> np.ndarray:
+    """*plane* linearly scaled so *limits* map to 0 and 255, clipped."""
+    lo, hi = limits
+    scaled = (plane.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    return np.clip(np.rint(scaled), 0, 255).astype(np.uint8)
+
+
+_JPEG_PLANE = re.compile(r"z\d+\.jpg")
+
+
+def jpeg_plane_paths(job: ExportJob) -> list[Path]:
+    """Files a JPEG *job* writes: one per Z-plane in its output folder."""
+    nz = job.output_shape[0]
+    width = max(4, len(str(nz - 1)))
+    return [job.output / f"z{z:0{width}d}.jpg" for z in range(nz)]
+
+
+def _remove_jpeg_planes(folder: Path) -> None:
+    """Delete the plane files of an earlier or partial JPEG export from *folder*."""
+    if not folder.is_dir():
+        return
+    for f in folder.iterdir():
+        if _JPEG_PLANE.fullmatch(f.name):
+            f.unlink()
+    if not any(folder.iterdir()):
+        folder.rmdir()
+
+
+def _write_jpeg(job: ExportJob, chunk_z: int, progress: ProgressCallback,
+                cancel_check: Optional[CancelCheck]) -> None:
+    from PIL import Image
+
+    _remove_jpeg_planes(job.output)  # don't leave planes of a deeper earlier export
+    job.output.mkdir(parents=True, exist_ok=True)
+    paths = jpeg_plane_paths(job)
+    limits = jpeg_contrast_limits(job.source)
+    done = 0
+    for start, slab in _iter_slabs(job, chunk_z, cancel_check):
+        for z, plane in enumerate(slab, start):
+            Image.fromarray(to_uint8(plane, limits)).save(paths[z], quality=JPEG_QUALITY)
+            done += plane.size
+        progress(done, job.output_bytes)
+
+
+def _remove_output(job: ExportJob) -> None:
+    """Delete *job*'s (partial) output."""
+    if job.output.is_dir():
+        _remove_jpeg_planes(job.output)
+    else:
+        job.output.unlink(missing_ok=True)
+
+
 def _write_lux_h5(job: ExportJob, chunk_z: int, progress: ProgressCallback,
                   cancel_check: Optional[CancelCheck]) -> None:
     import h5py
@@ -389,6 +529,14 @@ def _write_lux_h5(job: ExportJob, chunk_z: int, progress: ProgressCallback,
                 "Pyramids for %s: %s (compute %.1fs, write %.1fs)", job.output.name,
                 ",".join(summary["levels"]) or "-", summary["compute_s"], summary["write_s"],
             )
+
+
+_WRITERS = {
+    FORMAT_LUX_H5: _write_lux_h5,
+    FORMAT_TIFF: _write_tiff,
+    FORMAT_OME_TIFF: _write_ome_tiff,
+    FORMAT_JPEG: _write_jpeg,
+}
 
 
 def run_export(
@@ -420,7 +568,7 @@ def run_export(
 
     total = plan.total_bytes
     finished = 0
-    writer = _write_lux_h5 if plan.fmt == FORMAT_LUX_H5 else _write_tiff
+    writer = _WRITERS[plan.fmt]
     for job in plan.jobs:
         def _progress(done: int, _total: int, base: int = finished) -> None:
             if progress_callback:
@@ -429,11 +577,11 @@ def run_export(
         try:
             writer(job, _chunk_z(job, ram_percent), _progress, cancel_check)
         except _Cancelled:
-            job.output.unlink(missing_ok=True)  # the writer has closed it by now
+            _remove_output(job)  # the writer has closed it by now
             logger.info("Export cancelled during %s", job.output.name)
             return None
         except BaseException:
-            job.output.unlink(missing_ok=True)  # never leave a truncated file behind
+            _remove_output(job)  # never leave a truncated file behind
             raise
         finished += job.output_bytes
         if progress_callback:
@@ -462,6 +610,8 @@ def _write_summary(plan: ExportPlan) -> Path:
             "pyramid_levels": [lvl[0] for lvl in job.levels],
             "outputs": [],
         })
+        if plan.fmt == FORMAT_JPEG:
+            entry["contrast_limits"] = list(jpeg_contrast_limits(src))
         entry["outputs"].append({"timepoint": job.timepoint, "file": job.output.name})
     summary = {
         "format": plan.fmt,
@@ -473,7 +623,64 @@ def _write_summary(plan: ExportPlan) -> Path:
     }
     path = plan.output_dir / SUMMARY_FILENAME
     path.write_text(json.dumps(summary, indent=2))
+    if plan.metadata_format != METADATA_JSON:
+        convert_json_metadata(path, plan.metadata_format)
     return path
+
+
+# --------------------------------------------------------------------------- #
+# Metadata as TXT / CSV
+# --------------------------------------------------------------------------- #
+
+
+def flatten_json(value: Any, prefix: str = "") -> list[tuple[str, str]]:
+    """``(key, value)`` rows for every leaf of a JSON *value*.
+
+    Keys are dotted paths, with list indices as numbers
+    (``layers.0.outputs.1.file``). Empty lists and objects are kept as ``[]`` /
+    ``{}``; ``null`` becomes an empty value.
+    """
+    if isinstance(value, dict) and value:
+        items = value.items()
+    elif isinstance(value, list) and value:
+        items = enumerate(value)
+    else:
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value)
+        elif value is None:
+            text = ""
+        elif isinstance(value, bool):
+            text = json.dumps(value)
+        else:
+            text = str(value)
+        return [(prefix, text)]
+    rows: list[tuple[str, str]] = []
+    for key, child in items:
+        rows += flatten_json(child, f"{prefix}.{key}" if prefix else str(key))
+    return rows
+
+
+def convert_json_metadata(path: Path | str, fmt: str) -> Path:
+    """Write the JSON file *path* as ``.txt`` or ``.csv`` next to it.
+
+    Both hold one row per leaf of the JSON, as :func:`flatten_json` gives:
+    ``key: value`` lines for TXT, ``key,value`` with a header row for CSV.
+    """
+    import csv
+
+    if fmt not in (METADATA_TXT, METADATA_CSV):
+        raise ValueError(f"Can't convert metadata to {fmt!r}")
+    path = Path(path)
+    rows = flatten_json(json.loads(path.read_text(encoding="utf-8")))
+    out = path.with_suffix(f".{fmt}")
+    with open(out, "w", encoding="utf-8", newline="") as f:
+        if fmt == METADATA_CSV:
+            writer = csv.writer(f)
+            writer.writerow(["key", "value"])
+            writer.writerows(rows)
+        else:
+            f.writelines(f"{key}: {value}\n" for key, value in rows)
+    return out
 
 
 # --------------------------------------------------------------------------- #

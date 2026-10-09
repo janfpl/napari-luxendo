@@ -292,7 +292,7 @@ def open_lux_dataset(path: Path | str, dataset_path: str) -> LuxVolume:
 
     Headers link to a specific dataset, e.g. ``/Data`` of a flat file or
     ``/timepoint_0/channel_0/raw_tile/Data`` of a nested one. The view is the
-    group holding that dataset, so its metadata and pyramid levels are the
+    group holding that link, so its metadata and pyramid levels are the
     ones next to it, not whatever sits at the file root.
     """
     import h5py
@@ -302,10 +302,13 @@ def open_lux_dataset(path: Path | str, dataset_path: str) -> LuxVolume:
     if target.rsplit("/", 1)[-1] != "Data":
         raise ValueError(f"{path.name}:{target}: expected a link to a Luxendo 'Data' dataset")
     f = open_h5(path)
-    obj = f.get(target)
-    if not isinstance(obj, h5py.Dataset):
+    # Take the group holding the link, not the parent of the dataset it points
+    # at: if Data is an external link, the dataset's parent belongs to the
+    # pixel file and the wrapper view's own metadata would be skipped.
+    parent_path, _, name = target.rpartition("/")
+    group = f.get(parent_path or "/")
+    if not isinstance(group, h5py.Group) or not name_in(group, name):
         raise ValueError(f"{path.name}:{target}: no such dataset")
-    group = obj.parent
     # The group may live in yet another file (an external link inside path).
     owner = Path(group.file.filename)
     view_name = group.name.rsplit("/", 1)[-1] or None
@@ -322,6 +325,9 @@ def open_lux_group(group: Any, owner_file: Path, view_name: str | None = None) -
     """
     import h5py
 
+    # Links inside the group are relative to the file that holds it, which is
+    # not the caller's file when an external link led here.
+    owner_file = Path(group.file.filename)
     data = get_member(group, "Data", owner_file)
     if data is None or not isinstance(data[0], h5py.Dataset) or data[0].ndim not in (2, 3):
         raise ValueError(f"{owner_file.name}:{group.name}: no usable 'Data' dataset")
@@ -331,9 +337,11 @@ def open_lux_group(group: Any, owner_file: Path, view_name: str | None = None) -
     if not detect_pyramid_levels(group) and data_ds.parent is not None:
         level_source, level_file = data_ds.parent, data_file
 
+    # The view's own metadata wins; otherwise use the one next to the
+    # full-resolution data, wherever the pyramid levels come from.
     meta_obj = get_member(group, "metadata", owner_file)
-    if meta_obj is None and level_source is not group:
-        meta_obj = get_member(level_source, "metadata", level_file)
+    if meta_obj is None and data_ds.parent != group:
+        meta_obj = get_member(data_ds.parent, "metadata", data_file)
     metadata = parse_metadata(meta_obj[0]) if meta_obj else {}
 
     levels, names, datasets, factors = [_as_dask(data_ds)], ["Data"], [data_ds], [(1, 1, 1)]

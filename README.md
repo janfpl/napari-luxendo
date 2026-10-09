@@ -29,16 +29,79 @@ OME-TIFF or JPEG.
 
 ## Installation
 
+### On a new PC with conda
+
+These steps work the same on Windows, macOS and Linux. On Windows, run them in
+the **Miniforge Prompt** (or **Anaconda Prompt**) from the Start menu; on
+macOS and Linux, in a normal terminal.
+
+1. **Install conda**, if the PC has none yet.
+   [Miniforge](https://conda-forge.org/download/) is recommended (it uses
+   the conda-forge channel by default). Miniconda or Anaconda work too.
+   Accept the defaults during installation.
+
+2. **Create an environment** with Python, napari, a Qt backend and git
+   (git is needed to install the plugin straight from GitHub):
+
+   ```bash
+   conda create -n napari-luxendo -c conda-forge python=3.11 napari pyqt git
+   ```
+
+3. **Activate it and install the plugin:**
+
+   ```bash
+   conda activate napari-luxendo
+   pip install git+https://github.com/janfpl/napari-luxendo.git
+   ```
+
+   Optionally add `numba` for faster pyramid generation when exporting to
+   `.lux.h5`:
+
+   ```bash
+   conda install -c conda-forge numba
+   ```
+
+4. **Start napari:**
+
+   ```bash
+   napari
+   ```
+
+   Check that the **Plugins** menu lists *Luxendo H5 Reader* with the
+   *Luxendo coordinates* and *Export (.lux.h5 / TIFF / JPEG)* widgets, then
+   drag a `.lux.h5` file onto the window.
+
+Every later session only needs `conda activate napari-luxendo` and then
+`napari`.
+
+**Updating** to the latest version:
+
 ```bash
-pip install git+https://github.com/janfpl/napari-luxendo.git
+conda activate napari-luxendo
+pip install --upgrade --force-reinstall --no-deps git+https://github.com/janfpl/napari-luxendo.git
 ```
 
-Into an existing napari environment (e.g. the Shifter conda env):
+**Removing** everything: `conda env remove -n napari-luxendo`.
+
+If `conda activate` fails with a message about `conda init` (common in
+Windows PowerShell or a fresh terminal), run `conda init` once, close the
+terminal and open a new one, or use the Miniforge / Anaconda Prompt instead.
+
+### Into an existing environment
+
+Into an environment that already has napari (e.g. the Shifter conda env):
 
 ```bash
 conda activate shifter
 pip install git+https://github.com/janfpl/napari-luxendo.git
 ```
+
+If git is not installed there, `conda install -c conda-forge git` first, or
+install from the source archive instead:
+`pip install https://github.com/janfpl/napari-luxendo/archive/refs/heads/main.zip`.
+
+Without conda, `pip install "napari-luxendo[napari] @ git+https://github.com/janfpl/napari-luxendo.git"`
+installs the plugin together with napari.
 
 ## Usage
 

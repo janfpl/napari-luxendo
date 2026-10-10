@@ -11,7 +11,8 @@ level, or a generated preview whose on-disk cache is complete (see
 :mod:`._preview_cache`). An uncached preview is a sample of full resolution
 and would be slower, not faster.
 
-``NAPARI_LUXENDO_SCROLL_PREVIEW=0`` turns it off.
+``NAPARI_LUXENDO_SCROLL_PREVIEW=0`` turns it off. Coarse levels of tracked
+layers are drawn centred over full resolution either way (see :mod:`._center`).
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import os
 import weakref
 from typing import Any, Callable, Optional
 
+from ._center import center_levels
 from ._preview import level_is_cheap
 
 logger = logging.getLogger(__name__)
@@ -39,8 +41,6 @@ def enabled() -> bool:
 
 def install_current_viewer() -> None:
     """Attach the controller to the napari viewer that is opening a file, if any."""
-    if not enabled():
-        return
     try:
         import napari
 
@@ -105,6 +105,10 @@ class ScrollPreview:
         if layer in self._layers or not getattr(layer, 'multiscale', False) \
                 or 'luxendo' not in getattr(layer, 'metadata', {}):
             return
+        center_levels(layer)
+        self._layers.add(layer)
+        if not enabled():
+            return
         original = layer._update_draw
         dims = self.viewer.dims
         state: dict[str, Any] = {'step': (tuple(dims.current_step), dims.ndisplay)}
@@ -125,7 +129,6 @@ class ScrollPreview:
                 setattr(layer, name, _before_slice(controller, layer, method))
         layer._update_draw = update_draw
         layer._luxendo_draw_state = state
-        self._layers.add(layer)
 
     def _on_slice(self, layer, dims) -> None:
         """A slice is about to be made: if a slider moved, go coarse first."""

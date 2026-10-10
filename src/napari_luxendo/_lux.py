@@ -254,6 +254,8 @@ class LuxVolume:
     datasets: list[Any] = field(default_factory=list)  # h5py dataset per level
     factors: list[tuple[int, int, int]] = field(default_factory=list)  # (z, y, x) per level
     view_name: str | None = None  # group name inside a nested/main file
+    _readers: dict[int, Any] = field(default_factory=dict, init=False, repr=False,
+                                     compare=False)
 
     @property
     def data(self) -> da.Array:
@@ -283,10 +285,23 @@ class LuxVolume:
 
     def read(self, level: int, region: tuple[slice, slice, slice]) -> np.ndarray:
         """Read a ``(z, y, x)`` region of *level* straight from HDF5."""
-        ds = self.datasets[level]
-        if ds.ndim == 2:
+        reader = self.reader(level)
+        if reader is None:
+            ds = self.datasets[level]
             return np.asarray(ds[region[1], region[2]])[np.newaxis][region[0]]
-        return reader_for(ds)[region]
+        return reader[region]
+
+    def reader(self, level: int):
+        """The chunk reader of a 3D *level* (None for a 2D one), looked up once.
+
+        Later reads then need no h5py call to find it (see :mod:`._fastio`).
+        """
+        try:
+            return self._readers[level]
+        except KeyError:
+            ds = self.datasets[level]
+            reader = self._readers[level] = None if ds.ndim == 2 else reader_for(ds)
+            return reader
 
 
 def _strip_ext(name: str) -> str:

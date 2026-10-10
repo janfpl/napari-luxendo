@@ -16,6 +16,7 @@ import dask.array as da
 import numpy as np
 
 from ._preview_cache import PreviewCache
+from ._tilecache import BLOCK_YX, CachedSource
 
 
 def preview_factors(shape):
@@ -77,21 +78,45 @@ class SampledSource:
 def preview_levels(source):
     factors = preview_factors(source.shape)
     cache = PreviewCache.for_source(source, factors) if factors else None
-    return [da.from_array(SampledSource(source, f, cache, i), chunks=(1, 512, 512),
+    return [da.from_array(_cached(SampledSource(source, f, cache, i)), chunks=(1, BLOCK_YX, BLOCK_YX),
                           name='luxendo-preview-' + uuid.uuid4().hex,
                           asarray=False, fancy=False,
                           meta=np.empty((0, 0, 0), dtype=source.dtype))
             for i, f in enumerate(factors)]
 
 
+def _cached(sampled):
+    # Samples served while the averaged cache builds would go stale in memory.
+    return CachedSource(sampled, lambda: sampled.cache is None or sampled.cache.ready)
+
+
+_FOUND: dict = {}
+
+
 def preview_caches(array):
     """The preview caches behind a (possibly stacked) display level, if any."""
+    # Walking the graph materialises every block key, so it is done once per
+    # array (Dask names are unique per array content).
+    found = _FOUND.get(array.name)
+    if found is None:
+        found = _FOUND[array.name] = _find_caches(array)
+        if len(_FOUND) > 1024:
+            _FOUND.pop(next(iter(_FOUND)))
+    return found
+
+
+def forget_caches() -> None:
+    _FOUND.clear()
+
+
+def _find_caches(array):
     graph = array.__dask_graph__()
     found = []
     for name, layer in getattr(graph, 'layers', {}).items():
         if not str(name).startswith('original-luxendo-preview-'):
             continue
         for value in dict(layer).values():
+            value = value.inner if isinstance(value, CachedSource) else value
             if isinstance(value, SampledSource) and value.cache is not None:
                 found.append(value.cache)
             elif isinstance(value, SampledSource):

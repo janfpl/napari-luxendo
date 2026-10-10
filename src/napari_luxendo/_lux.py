@@ -27,6 +27,8 @@ import dask.array as da
 import numpy as np
 
 from ._fastio import close_readers, reader_for
+from ._tilecache import BLOCK_YX, CachedSource
+from ._tilecache import clear as clear_tiles
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +74,12 @@ def close_all() -> None:
     Any layer still backed by those files will fail to read afterwards, so
     only call this once the layers are gone.
     """
+    from ._preview import forget_caches
     from ._preview_cache import close_caches
 
+    forget_caches()
     close_caches()
+    clear_tiles()
     close_readers()
     with _OPEN_LOCK:
         for f in _OPEN_FILES.values():
@@ -238,7 +243,7 @@ def _as_dask(ds: Any) -> da.Array:
     """Expose individual planes; storage chunks must not dictate display reads."""
     if ds.ndim == 2:
         return da.from_array(ds, chunks=(-1, -1))[np.newaxis]
-    return da.from_array(reader_for(ds), chunks=(1, 512, 512),
+    return da.from_array(CachedSource(reader_for(ds)), chunks=(1, BLOCK_YX, BLOCK_YX),
                          name='luxendo-data-' + uuid.uuid4().hex,
                          asarray=False, fancy=False, meta=np.empty((0, 0, 0), dtype=ds.dtype))
 

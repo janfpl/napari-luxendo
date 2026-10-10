@@ -1,25 +1,43 @@
-"""Show a coarser pyramid level while a slider moves, and full detail once it stops.
+"""Show a coarser pyramid level while the view moves, full detail once it stops,
+and prefetch the surroundings of the view.
 
 In 2D napari loads exactly one level of a multiscale layer, the one that fits
-the canvas. While the user scrolls through Z (or time) every step therefore
-waits for a full-detail plane. This controller makes napari pick a level
-about two steps coarser while a slider is moving, and goes back to the level
-napari would pick once the slider has been still for a moment.
+the canvas, and only the part of it on screen. While the user scrolls through
+Z (or time) or zooms, every step therefore waits for a full-detail read, and
+every pan step reads the newly visible area from disk. This controller:
 
-It only switches when the coarser level is cheap to read: a native pyramid
+* makes napari pick a level about two steps coarser while a slider moves or
+  the camera zooms, and goes back to the level napari would pick once the
+  view has been still for a moment. A zoom step whose full-detail area is
+  already in memory is shown at full detail right away;
+* once the view stops, reads the area around the view
+  (one screen in every direction by default) at the displayed level and the
+  two coarser ones into the in-memory block cache (:mod:`._tilecache`) while
+  napari is idle, so a pan into it shows from memory.
+
+The coarser level is only used when it is cheap to read: a native pyramid
 level, or a generated preview whose on-disk cache is complete (see
 :mod:`._preview_cache`). An uncached preview is a sample of full resolution
 and would be slower, not faster.
 
-``NAPARI_LUXENDO_SCROLL_PREVIEW=0`` turns it off.
+``NAPARI_LUXENDO_SCROLL_PREVIEW=0`` turns it all off.
+``NAPARI_LUXENDO_PREFETCH`` is the prefetch distance in screens (default 1,
+``0`` turns prefetching off). ``NAPARI_LUXENDO_PREFETCH_Z`` is how many
+planes above and below the view are prefetched too (default 2); a Z step onto
+one of them shows full detail at once instead of the coarse level.
+While Luxendo layers are open, napari's own Dask cache is turned off (see
+:class:`_DaskCacheSwitch`).
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 import weakref
+from collections import deque
 from typing import Any, Callable, Optional
 
+from . import _tilecache
 from ._preview import level_is_cheap
 
 logger = logging.getLogger(__name__)
@@ -29,12 +47,21 @@ logger = logging.getLogger(__name__)
 _SCROLL_DOWNSCALE = 4
 # Slider stillness (ms) after which full detail is loaded.
 _SETTLE_MS = 200
+# Coarser levels prefetched around the view, besides the displayed one.
+_PREFETCH_COARSER = 2
 
 _CONTROLLERS: "weakref.WeakKeyDictionary[Any, ScrollPreview]" = weakref.WeakKeyDictionary()
 
 
 def enabled() -> bool:
     return os.environ.get('NAPARI_LUXENDO_SCROLL_PREVIEW', '1') != '0'
+
+
+def prefetch_screens() -> float:
+    try:
+        return max(0.0, float(os.environ.get('NAPARI_LUXENDO_PREFETCH', '1')))
+    except ValueError:
+        return 1.0
 
 
 def install_current_viewer() -> None:
@@ -89,16 +116,48 @@ class ScrollPreview:
     def __init__(self, viewer, timer=None) -> None:
         self.viewer = viewer
         self.scrolling = False
+        self.zooming = False
         self._restart = timer(self.settle) if timer is not None else None
+        self.prefetcher = Prefetcher()
         self._layers: "weakref.WeakSet[Any]" = weakref.WeakSet()
         self._coarse: "weakref.WeakSet[Any]" = weakref.WeakSet()
         self._tried: "weakref.WeakSet[Any]" = weakref.WeakSet()  # this scroll
         viewer.layers.events.inserted.connect(self._on_inserted)
+        viewer.layers.events.removed.connect(self._on_removed)
+        viewer.camera.events.zoom.connect(self._on_zoom)
+        viewer.camera.events.center.connect(self._on_pan)
         for layer in viewer.layers:
             self.track(layer)
 
+    @property
+    def moving(self) -> bool:
+        return self.scrolling or self.zooming
+
+    def _on_zoom(self, event=None) -> None:
+        """The camera zoomed: show coarse first wherever full detail is not in memory."""
+        self.zooming = True
+        self.prefetcher.cancel()
+        if self._restart is not None:
+            self._restart()
+
+    def _on_pan(self, event=None) -> None:
+        """The camera moved: pause prefetching until it stops.
+
+        Prefetch reads run between events, so they would compete with the
+        display reads of the drag itself.
+        """
+        self.prefetcher.cancel()
+        if self._restart is not None:
+            self._restart()
+
     def _on_inserted(self, event) -> None:
         self.track(event.value)
+
+    def _on_removed(self, event) -> None:
+        layer = event.value
+        if layer in self._layers:
+            self._layers.discard(layer)
+            _napari_dask_cache.release(layer)
 
     def track(self, layer) -> None:
         """Let *layer* use coarse levels while scrolling (Luxendo multiscale images)."""
@@ -112,8 +171,14 @@ class ScrollPreview:
 
         def update_draw(scale_factor, corner_pixels_displayed, shape_threshold):
             state['args'] = (scale_factor, corner_pixels_displayed, shape_threshold)
-            if controller.scrolling and layer in controller._coarse:
-                shape_threshold = tuple(max(1, int(s) // _SCROLL_DOWNSCALE) for s in shape_threshold)
+            if controller.zooming and not controller.scrolling:
+                try:
+                    controller._choose_for_zoom(layer, original, state['args'])
+                except Exception as exc:  # never break drawing
+                    logger.debug('Zoom preview: %s', exc)
+                    controller._coarse.discard(layer)
+            if controller.moving and layer in controller._coarse:
+                shape_threshold = _coarse_threshold(shape_threshold)
             return original(scale_factor, corner_pixels_displayed, shape_threshold)
 
         # napari's own dims handler runs before any plugin callback, so a
@@ -126,6 +191,7 @@ class ScrollPreview:
         layer._update_draw = update_draw
         layer._luxendo_draw_state = state
         self._layers.add(layer)
+        _napari_dask_cache.hold(layer)
 
     def _on_slice(self, layer, dims) -> None:
         """A slice is about to be made: if a slider moved, go coarse first."""
@@ -137,10 +203,22 @@ class ScrollPreview:
         if last is None or last == step or dims.ndisplay != 2 or last[1] != 2:
             return
         self.scrolling = True
-        if layer not in self._tried:
+        self.prefetcher.cancel()
+        if layer not in self._tried and not self._step_in_memory(layer, dims):
             self._go_coarse(layer)
         if self._restart is not None:
             self._restart()
+
+    def _step_in_memory(self, layer, dims) -> bool:
+        """True if the full-detail view at the new slider position is in the block cache."""
+        if layer in self._coarse or not layer.visible:
+            return False
+        try:
+            return region_in_memory(layer, layer.data_level, layer.corner_pixels,
+                                    _data_point(layer, dims))
+        except Exception as exc:
+            logger.debug('Scroll preview: %s', exc)
+            return False
 
     def _go_coarse(self, layer) -> None:
         state = getattr(layer, '_luxendo_draw_state', {})
@@ -160,18 +238,60 @@ class ScrollPreview:
             self._coarse.discard(layer)
             _redraw(layer, state['args'], refresh=False)
 
-    def settle(self) -> None:
-        """The slider stopped: load the level napari would pick for every layer."""
-        if not self.scrolling:
+    def _choose_for_zoom(self, layer, original, args) -> None:
+        """Decide whether this zoom step shows *layer* coarse or at full detail."""
+        if not layer.visible or self.viewer.dims.ndisplay != 2:
             return
-        self.scrolling = False
-        layers = list(self._coarse)
-        self._coarse = weakref.WeakSet()
-        self._tried = weakref.WeakSet()
-        for layer in layers:
-            state = getattr(layer, '_luxendo_draw_state', {})
-            if 'args' in state:
-                _redraw(layer, state['args'], refresh=True)
+        before = (layer._data_level, layer.corner_pixels.copy())
+        scale_factor, corners, threshold = args
+        layer.refresh = _no_refresh
+        try:
+            original(scale_factor, corners, threshold)
+            fine = layer.data_level
+            if region_in_memory(layer, fine, layer.corner_pixels):
+                coarse_ok = False
+            else:
+                original(scale_factor, corners, _coarse_threshold(threshold))
+                coarse = layer.data_level
+                coarse_ok = coarse != fine and level_is_cheap(layer.data[coarse])
+        finally:
+            del layer.refresh
+            layer._data_level, layer.corner_pixels = before
+        if coarse_ok:
+            self._coarse.add(layer)
+        else:
+            self._coarse.discard(layer)
+
+    def settle(self) -> None:
+        """The view stopped: load the level napari would pick, then prefetch around it."""
+        if self.moving:
+            self.scrolling = self.zooming = False
+            layers = list(self._coarse)
+            self._coarse = weakref.WeakSet()
+            self._tried = weakref.WeakSet()
+            for layer in layers:
+                state = getattr(layer, '_luxendo_draw_state', {})
+                if 'args' in state:
+                    _redraw(layer, state['args'], refresh=True)
+        self.prefetch()
+
+    def prefetch(self) -> None:
+        """Queue idle-time reads of the area around the view, nearest first."""
+        screens = prefetch_screens()
+        if screens <= 0 or _tilecache.store() is None:
+            return
+        jobs = []
+        for layer in list(self._layers):
+            try:
+                jobs.extend(prefetch_jobs(layer, screens))
+            except Exception as exc:
+                logger.debug('Prefetch: %s', exc)
+        jobs.sort(key=lambda job: job[0])
+        self.prefetcher.schedule([job for _, job in jobs])
+
+    def wait_prefetch(self, timeout: Optional[float] = None) -> bool:
+        """Block until queued prefetching is done (benchmarks, tests)."""
+        return self.prefetcher.wait(timeout)
 
 
 def _before_slice(controller, layer, method):
@@ -199,3 +319,246 @@ def _redraw(layer, args, refresh: bool) -> None:
 
 def _no_refresh(*args, **kwargs) -> None:
     pass
+
+
+class _DaskCacheSwitch:
+    """Turns napari's opportunistic Dask cache off while Luxendo layers are open.
+
+    The block cache (:mod:`._tilecache`) already keeps what those layers show,
+    and napari's cache bookkeeping cost about 15 ms of every pan step. The
+    cache is a single process-wide object, so other Dask layers lose it too
+    while Luxendo data is open. Its previous size comes back when the last
+    Luxendo layer is removed. Nothing changes when the block cache is off
+    (``NAPARI_LUXENDO_TILE_CACHE_MB=0``) or with
+    ``NAPARI_LUXENDO_NAPARI_DASK_CACHE=1``.
+    """
+
+    def __init__(self) -> None:
+        self._holders: "weakref.WeakSet[Any]" = weakref.WeakSet()
+        self._saved: Optional[int] = None
+
+    def hold(self, layer) -> None:
+        self._holders.add(layer)
+        if self._saved is None and _tilecache.store() is not None \
+                and os.environ.get('NAPARI_LUXENDO_NAPARI_DASK_CACHE', '0') != '1':
+            try:
+                from napari.utils import resize_dask_cache
+
+                saved = int(resize_dask_cache().cache.available_bytes)
+                resize_dask_cache(0)
+                self._saved = saved
+            except Exception as exc:
+                logger.debug('napari Dask cache: %s', exc)
+
+    def release(self, layer) -> None:
+        self._holders.discard(layer)
+        if not self._holders and self._saved is not None:
+            saved, self._saved = self._saved, None
+            try:
+                from napari.utils import resize_dask_cache
+
+                resize_dask_cache(saved)
+            except Exception as exc:
+                logger.debug('napari Dask cache: %s', exc)
+
+
+_napari_dask_cache = _DaskCacheSwitch()
+
+
+def _coarse_threshold(shape_threshold):
+    return tuple(max(1, int(s) // _SCROLL_DOWNSCALE) for s in shape_threshold)
+
+
+def _single_plane(layer) -> bool:
+    """True if napari shows one plane (newer napari projects a zero-thickness slab)."""
+    if str(getattr(layer.projection_mode, 'value', layer.projection_mode)) == 'none':
+        return True
+    data_slice = layer._data_slice
+    margins = [getattr(data_slice, n, None) for n in ('margin_left', 'margin_right')]
+    import numpy as np
+
+    return all(m is not None and not np.any(np.nan_to_num(np.asarray(m, dtype=float))) for m in margins)
+
+
+def _plane_index(layer, level, point=None):
+    """napari's index of the displayed plane at *level*: ints, and slice(None) on screen.
+
+    The same arithmetic as napari's image slice request: the data point
+    (*point*, or the one napari last sliced at), divided by the level's
+    downsampling, clipped to the level and rounded.
+    """
+    import numpy as np
+
+    if point is None:
+        point = layer._data_slice.point
+    point = np.asarray(point, dtype=float)
+    point = point / np.asarray(layer.downsample_factors[level], dtype=float)
+    point = np.clip(point, 0, np.asarray(layer.level_shapes[level]) - 1)
+    return [slice(None) if np.isnan(p) else int(np.round(p)) for p in point]
+
+
+def _data_point(layer, dims):
+    """The data point a slice at *dims* will show, NaN on the displayed axes."""
+    import numpy as np
+
+    point = np.asarray(layer.world_to_data(np.asarray(dims.point)[-layer.ndim:]), dtype=float)
+    point[list(layer._slice_input.displayed)] = np.nan
+    return point
+
+
+def locate(layer, level, point=None):
+    """The cached source and plane napari shows *layer* at *level* from, or None.
+
+    *point* is a data point to locate instead of the one last shown.
+    """
+    if _tilecache.store() is None or not _single_plane(layer):
+        return None
+    array = layer.data[level]
+    displayed = list(layer._slice_input.displayed)
+    if displayed != [array.ndim - 2, array.ndim - 1]:
+        return None  # only the usual (..., Y, X) display is prefetched
+    index = _plane_index(layer, level, point)
+    memo = layer._luxendo_draw_state.setdefault('located', {})
+    memo_key = (level, tuple(i for i in index if isinstance(i, int)))
+    if memo_key not in memo:
+        import dask
+        import numpy as np
+
+        key = tuple(slice(0, 1) if isinstance(i, slice) else i for i in index)
+        with _tilecache.locate() as found, dask.config.set(scheduler='synchronous'):
+            np.asarray(array[key])
+        sources = {(id(s), z): (s, z) for s, z in found}
+        memo[memo_key] = next(iter(sources.values())) if len(sources) == 1 else None
+    return memo[memo_key]
+
+
+def region_in_memory(layer, level, corners, point=None) -> bool:
+    """True if the on-screen part of *level* (napari corner pixels) is in the block cache."""
+    where = locate(layer, level, point)
+    if where is None:
+        return False
+    source, z = where
+    (y0, x0), (y1, x1) = corners[:, -2:]
+    return source.has_region(z, int(y0), int(y1) + 1, int(x0), int(x1) + 1)
+
+
+def prefetch_jobs(layer, screens: float):
+    """(distance, read) pairs for the blocks around the view of *layer*."""
+    import numpy as np
+
+    if not layer.visible or layer._slice_input.ndisplay != 2 or not layer.multiscale \
+            or 'luxendo' not in layer.metadata \
+            or 'args' not in getattr(layer, '_luxendo_draw_state', {}):
+        return []  # not drawn yet: napari's corners are not a view
+    level = int(layer.data_level)
+    factors = np.asarray(layer.downsample_factors)[:, -2:]
+    corners = np.asarray(layer.corner_pixels)[:, -2:].astype(float)
+    corners[1] += 1
+    # The view in full-resolution pixels, its centre and size.
+    view0 = corners * factors[level]
+    centre0 = view0.mean(axis=0)
+    size0 = np.maximum(view0[1] - view0[0], 1)
+    b = _tilecache.BLOCK_YX
+    jobs = []
+    for k in range(level, min(len(layer.data) - 1, level + _PREFETCH_COARSER) + 1):
+        if k > level and not level_is_cheap(layer.data[k]):
+            continue
+        where = locate(layer, k)
+        if where is None:
+            continue
+        source, z = where
+        shape = np.asarray(source.shape[1:])
+        if k == level:
+            # The view itself on the neighbouring planes, for Z steps.
+            vlo = np.clip(np.floor(view0[0] / factors[k]), 0, shape).astype(int)
+            vhi = np.clip(np.ceil(view0[1] / factors[k]), 0, shape).astype(int)
+            for dz in _z_offsets():
+                if not 0 <= z + dz < source.shape[0]:
+                    continue
+                for by in range(vlo[0] // b, -(-vhi[0] // b)):
+                    for bx in range(vlo[1] // b, -(-vhi[1] // b)):
+                        jobs.append((0.2 * abs(dz), _filler(source, z + dz, by, bx)))
+        lo = np.clip(np.floor((view0[0] - screens * size0) / factors[k]), 0, shape).astype(int)
+        hi = np.clip(np.ceil((view0[1] + screens * size0) / factors[k]), 0, shape).astype(int)
+        for by in range(lo[0] // b, -(-hi[0] // b)):
+            for bx in range(lo[1] // b, -(-hi[1] // b)):
+                mid = (np.array([by, bx]) + 0.5) * b * factors[k]
+                # Nearest first; coarser levels just after blocks at the same distance.
+                distance = float(np.max(np.abs(mid - centre0) / size0)) + 0.01 * (k - level)
+                jobs.append((distance, _filler(source, z, by, bx)))
+    return jobs
+
+
+def _z_offsets():
+    """Neighbouring planes prefetched for the view (``NAPARI_LUXENDO_PREFETCH_Z``, default 2)."""
+    try:
+        n = max(0, int(os.environ.get('NAPARI_LUXENDO_PREFETCH_Z', '2')))
+    except ValueError:
+        n = 2
+    return [d for k in range(1, n + 1) for d in (k, -k)]
+
+
+def _filler(source, z, by, bx):
+    return lambda: source.fill_block(z, by, bx)
+
+
+class Prefetcher:
+    """Runs the latest batch of reads on the GUI thread while napari is idle.
+
+    The reads are not done in a background thread: h5py releases the GIL
+    inside HDF5 reads while holding its library lock, and a GUI thread that
+    frees an h5py object at that moment can deadlock with it (seen with
+    h5py 3.14-3.16 when prefetching native pyramid levels). Instead, a
+    zero-interval Qt timer reads blocks for up to ``_BUDGET_S`` per event
+    loop pass, so input is handled between them. A new batch, or
+    :meth:`cancel`, drops the rest of the previous one. Without a Qt
+    application (scripts, tests) the reads run in :meth:`wait`.
+    """
+
+    _BUDGET_S = 0.010
+
+    def __init__(self) -> None:
+        self._jobs: "deque[Callable[[], None]]" = deque()
+        self._timer = None
+        try:
+            from qtpy.QtCore import QTimer
+            from qtpy.QtWidgets import QApplication
+
+            if QApplication.instance() is not None:
+                self._timer = QTimer()
+                self._timer.setInterval(0)
+                self._timer.timeout.connect(self._tick)
+        except Exception:
+            self._timer = None
+
+    def cancel(self) -> None:
+        self._jobs.clear()
+        if self._timer is not None:
+            self._timer.stop()
+
+    def schedule(self, jobs) -> None:
+        self._jobs = deque(jobs)
+        if self._timer is not None:
+            if self._jobs:
+                self._timer.start()
+            else:
+                self._timer.stop()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        """Run what is left now (benchmarks, tests, no Qt event loop)."""
+        self._run(None if timeout is None else time.perf_counter() + timeout)
+        return not self._jobs
+
+    def _tick(self) -> None:
+        self._run(time.perf_counter() + self._BUDGET_S)
+        if not self._jobs and self._timer is not None:
+            self._timer.stop()
+
+    def _run(self, deadline: Optional[float]) -> None:
+        while self._jobs and (deadline is None or time.perf_counter() < deadline):
+            job = self._jobs.popleft()
+            try:
+                job()
+            except Exception as exc:  # a closed file, a removed layer
+                logger.debug('Prefetch: %s', exc)
+                self._jobs.clear()

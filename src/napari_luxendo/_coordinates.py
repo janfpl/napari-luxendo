@@ -44,7 +44,10 @@ def set_coordinates(layer: Any, mode: str) -> None:
     # The placement lives in the affine alone, so the result does not depend
     # on how the reader first placed the layer (by affine or by scale).
     layer.scale = np.ones(ndim)
-    layer.translate = np.zeros(ndim)
+    translate = np.zeros(ndim)
+    # A tile's own Z plane (see _tiles) is a shift of its voxel grid along Z.
+    translate[ndim - 3] = -float(layer.metadata.get("plane_offset", 0))
+    layer.translate = translate
     layer.affine = np.asarray(target, dtype=float)
     layer.metadata["coordinates"] = mode
 

@@ -68,7 +68,8 @@ macOS and Linux, in a normal terminal.
    ```
 
    Check that the **Plugins** menu lists *Luxendo H5 Reader* with the
-   *Luxendo coordinates* and *Export (.lux.h5 / TIFF / JPEG)* widgets, then
+   *Luxendo coordinates*, *Luxendo tiles* and *Export (.lux.h5 / TIFF / JPEG)*
+   widgets, then
    drag a `.lux.h5` file onto the window.
 
 Every later session only needs `conda activate napari-luxendo` and then
@@ -175,6 +176,26 @@ no rotation, flip or stage offset. 2D slices are then the planes the camera
 took, without the "non-orthogonal slicing" warning, but views no longer line up
 with each other. Switch it off to return to sample space. Layers opened while it
 is on follow it. From Python: `napari_luxendo._coordinates.set_coordinates(layer, "camera")`.
+
+### Unstitching tiles
+
+**Plugins > Luxendo H5 Reader > Luxendo tiles** opens a dock widget with two
+switches:
+
+- **Unstitch tiles** replaces every mosaic layer with one layer per tile,
+  placed where the tile sits in the mosaic and with the mosaic's colormap and
+  contrast. Mosaics opened while it is on are unstitched too. Switching it off
+  puts the mosaic layers back.
+- **Sync planes** (available once tiles are unstitched, on by default). Each
+  tile gets its own Z slider in the widget. With *Sync planes* on, moving one
+  tile's slider moves every tile's Z plane with it. With it off, a slider moves
+  only its own tile, so tiles can show different planes side by side.
+  napari's own Z slider always moves all tiles together and keeps the
+  differences between them.
+
+napari has a single Z position for the whole viewer, so a tile's own plane is
+a shift of that tile along Z by whole planes. In 3D a tile moved this way is
+drawn shifted by the same amount.
 
 ### Export
 

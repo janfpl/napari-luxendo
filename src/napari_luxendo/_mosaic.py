@@ -27,7 +27,7 @@ import dask.array as da
 import numpy as np
 
 from ._lux import LuxVolume
-from ._preview import preview_levels
+from ._preview import dataset_identity, preview_levels
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +142,14 @@ class _MosaicSource:
         key = tuple(slice(*s.indices(n)) for s, n in zip(key, self.shape))
         return _fill_region(key, self.dtype, self.placed, self.spacing)
 
+    def cache_key(self):
+        """Identity of the stitched pixels, for the on-disk preview cache."""
+        return [list(self.shape), [float(s) for s in self.spacing]] + [
+            [None if p.vol is None else dataset_identity(p.vol.datasets[p.level]),
+             p.level, p.start.tolist(), p.stop.tolist()]
+            for p in self.placed
+        ]
+
 
 class _Placed:
     """One tile at one level, positioned on the mosaic grid.
@@ -199,14 +207,21 @@ def _fill_region(key, dtype, placed, spacing):
         dz = ((zs - p.center[0]) * spacing[0]) ** 2
         d_z[i] = np.where((zs >= p.start[0]) & (zs < p.stop[0]), dz, np.inf)
 
-    # Planes whose per-tile Z distances are identical share one 2D owner map
-    # (for an ordinary XY tile grid that is every plane of the block).
+    # Planes whose per-tile Z distances differ only by a constant share one 2D
+    # owner map: adding the same value to every tile's distance does not
+    # change the nearest one. For an ordinary XY tile grid (all tiles span the
+    # same planes) that is every plane of the block.
+    shifted = d_z.copy()
+    finite = np.isfinite(d_z)
+    for z in range(len(zs)):
+        if finite[:, z].any():
+            shifted[:, z] -= d_z[finite[:, z], z].min()
     patterns: dict[bytes, list[int]] = {}
     for z in range(len(zs)):
-        patterns.setdefault(d_z[:, z].tobytes(), []).append(z)
+        patterns.setdefault(shifted[:, z].tobytes(), []).append(z)
 
     for planes in patterns.values():
-        dz = d_z[:, planes[0]]
+        dz = shifted[:, planes[0]]
         total = d_yx + dz[:, None, None]
         owner = np.argmin(total, axis=0).astype(np.int16)
         owner[~np.isfinite(total.min(axis=0))] = -1

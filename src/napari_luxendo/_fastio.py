@@ -56,7 +56,10 @@ class ChunkReader:
     def close(self):
         with self._lock:
             if self._mapping is not None:
-                self._mapping.close()
+                try:
+                    self._mapping.close()
+                except BufferError:
+                    pass  # a read in another thread still holds a view; GC closes it
                 self._mapping = None
             self._offsets.clear()
             self._index = None
@@ -109,40 +112,52 @@ class ChunkReader:
                     self._direct = False
                     return np.asarray(self.ds[key])
             chunks = self.ds.chunks
-            # Enumerate only chunks containing at least one requested sample.
-            axes = [np.unique(np.arange(s.start, s.stop, s.step) // c)
-                    for s, c in zip(key, chunks)]
-            out = np.full(counts, self.ds.fillvalue, dtype=self.dtype)
             chunk_bytes = int(np.prod(chunks)) * self.dtype.itemsize
             self._build_index(chunk_bytes)
             if not self._direct:
                 return np.asarray(self.ds[key])
-            for index in itertools.product(*axes):
-                origin = tuple(int(i*c) for i, c in zip(index, chunks))
-                if self._index is not None:
-                    offset = int(self._index[index])
-                    if offset < 0:
-                        continue
-                elif origin not in self._offsets:
-                    info = self.ds.id.get_chunk_info_by_coord(origin)
-                    offset = info.byte_offset
-                    if offset is not None and (info.filter_mask != 0 or info.size != chunk_bytes
-                                              or offset + chunk_bytes > len(self._mapping)):
-                        # Never interpret an unexpected storage layout as pixels.
-                        self._direct = False
-                        return np.asarray(self.ds[key])
-                    self._offsets[origin] = offset
-                else:
-                    offset = self._offsets[origin]
-                if offset is None:
-                    continue  # unwritten chunk retains the dataset fill value
-                dest, source = [], []
-                for s, n, start, width in zip(key, counts, origin, chunks):
-                    a = max(0, -(-(start-s.start) // s.step))
-                    b = min(n, -(-(start+width-s.start) // s.step))
-                    dest.append(slice(a, b))
-                    source.append(slice(s.start+a*s.step-start,
-                                        s.start+(b-1)*s.step-start+1, s.step))
-                chunk = np.ndarray(chunks, dtype=self.dtype, buffer=self._mapping, offset=offset)
-                out[tuple(dest)] = chunk[tuple(source)]
-            return out
+            mapping, dense = self._mapping, self._index
+            if dense is None:
+                return self._read_chunks(key, counts, mapping, None)
+        # With a dense index nothing shared changes during a read, so it runs
+        # outside the lock: the dask blocks of one tile load in parallel, and
+        # a background preview-cache build does not stall the display.
+        return self._read_chunks(key, counts, mapping, dense)
+
+    def _read_chunks(self, key, counts, mapping, dense):
+        """Copy *key* chunk by chunk; *dense* is the chunk index, if built."""
+        chunks = self.ds.chunks
+        chunk_bytes = int(np.prod(chunks)) * self.dtype.itemsize
+        # Enumerate only chunks containing at least one requested sample.
+        axes = [np.unique(np.arange(s.start, s.stop, s.step) // c)
+                for s, c in zip(key, chunks)]
+        out = np.full(counts, self.ds.fillvalue, dtype=self.dtype)
+        for index in itertools.product(*axes):
+            origin = tuple(int(i*c) for i, c in zip(index, chunks))
+            if dense is not None:
+                offset = int(dense[index])
+                if offset < 0:
+                    continue
+            elif origin not in self._offsets:
+                info = self.ds.id.get_chunk_info_by_coord(origin)
+                offset = info.byte_offset
+                if offset is not None and (info.filter_mask != 0 or info.size != chunk_bytes
+                                          or offset + chunk_bytes > len(mapping)):
+                    # Never interpret an unexpected storage layout as pixels.
+                    self._direct = False
+                    return np.asarray(self.ds[key])
+                self._offsets[origin] = offset
+            else:
+                offset = self._offsets[origin]
+            if offset is None:
+                continue  # unwritten chunk retains the dataset fill value
+            dest, source = [], []
+            for s, n, start, width in zip(key, counts, origin, chunks):
+                a = max(0, -(-(start-s.start) // s.step))
+                b = min(n, -(-(start+width-s.start) // s.step))
+                dest.append(slice(a, b))
+                source.append(slice(s.start+a*s.step-start,
+                                    s.start+(b-1)*s.step-start+1, s.step))
+            chunk = np.ndarray(chunks, dtype=self.dtype, buffer=mapping, offset=offset)
+            out[tuple(dest)] = chunk[tuple(source)]
+        return out

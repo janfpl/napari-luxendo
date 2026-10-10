@@ -17,7 +17,11 @@ DESCRIPTIONS = ["Green-488", "Red-561"]
 
 
 @pytest.fixture(autouse=True)
-def _close_handles():
+def _close_handles(monkeypatch, tmp_path_factory):
+    # Previews stay exact nearest-neighbour samples unless a test turns the
+    # background cache on; never write into the real user cache directory.
+    monkeypatch.setenv("NAPARI_LUXENDO_PYRAMID_CACHE", "0")
+    monkeypatch.setenv("NAPARI_LUXENDO_CACHE_DIR", str(tmp_path_factory.mktemp("preview-cache")))
     yield
     lux.close_all()
 

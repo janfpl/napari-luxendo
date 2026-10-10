@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import uuid
@@ -39,6 +40,19 @@ _OPEN_FILES: dict[str, Any] = {}
 _OPEN_LOCK = threading.Lock()
 
 
+def _chunk_cache_bytes() -> int:
+    """HDF5 chunk cache per file, from ``NAPARI_LUXENDO_H5_CACHE_MB`` (default 64).
+
+    h5py's 1 MiB default holds two 64^3 uint16 chunks, so compressed data
+    (which cannot use the direct reader) decompressed every chunk again for
+    each Z plane. 64 MiB keeps the chunks under a 512x512 display block.
+    """
+    try:
+        return max(0, int(float(os.environ.get("NAPARI_LUXENDO_H5_CACHE_MB", "64")) * 2**20))
+    except ValueError:
+        return 64 * 2**20
+
+
 def open_h5(path: Path | str) -> Any:
     """Open (or reuse) a read-only h5py handle for *path*."""
     import h5py
@@ -47,7 +61,7 @@ def open_h5(path: Path | str) -> Any:
     with _OPEN_LOCK:
         f = _OPEN_FILES.get(key)
         if f is None or not f.id.valid:
-            f = h5py.File(key, "r")
+            f = h5py.File(key, "r", rdcc_nbytes=_chunk_cache_bytes(), rdcc_nslots=100_003)
             _OPEN_FILES[key] = f
         return f
 
@@ -58,6 +72,9 @@ def close_all() -> None:
     Any layer still backed by those files will fail to read afterwards, so
     only call this once the layers are gone.
     """
+    from ._preview_cache import close_caches
+
+    close_caches()
     close_readers()
     with _OPEN_LOCK:
         for f in _OPEN_FILES.values():

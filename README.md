@@ -268,7 +268,15 @@ directory must not hold the source files.
   less, and the least recently shown blocks are dropped first. Nothing is
   written to disk. `NAPARI_LUXENDO_TILE_CACHE_MB` sets the memory budget
   (`0` turns the cache off), and `NAPARI_LUXENDO_PREFETCH` sets the distance
-  in screens (`0` turns prefetching off).
+  in screens (`0` turns prefetching off). The view itself is also read on the
+  two planes above and below (`NAPARI_LUXENDO_PREFETCH_Z`), so stepping one
+  or two planes shows full detail at once.
+- **napari's Dask cache.** While Luxendo layers are open, the plugin turns
+  napari's own Dask cache (Preferences > Application) off, because the block
+  cache above already keeps those pixels and napari's cache bookkeeping
+  slowed every pan step. Other Dask layers lose napari's caching meanwhile.
+  The previous size comes back when the last Luxendo layer is removed.
+  `NAPARI_LUXENDO_NAPARI_DASK_CACHE=1` leaves napari's cache alone.
 - **Reading raw chunks.** Display requests read individual planes and crops.
   Uncompressed standard numeric HDF5 chunks use a read-only memory mapping,
   with every physical address obtained from the actual HDF5 chunk index.

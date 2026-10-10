@@ -163,3 +163,47 @@ def test_zoom_shows_coarse_level_first_unless_detail_is_in_memory(viewer_with_vo
     controller._on_zoom()
     _draw(layer, 1750, 1750, 150)
     assert controller.zooming and layer.data_level == 0
+
+
+def test_neighbouring_planes_are_prefetched_and_shown_at_full_detail(viewer_with_volume):
+    from napari_luxendo._scroll import locate
+
+    viewer, controller, layer, truth = viewer_with_volume
+    viewer.dims.set_current_step(0, 3)
+    controller.settle()
+    _draw(layer, 600, 600, 200)
+    controller.settle()
+    assert controller.wait_prefetch(30)
+    source, z = locate(layer, 0)
+    for dz in (-2, -1, 1, 2):
+        assert source.has_region(z + dz, 600, 801, 600, 801)
+    assert not source.has_region(z + 3, 600, 801, 600, 801)
+
+    # A step onto a prefetched plane keeps full detail; a step beyond goes coarse.
+    viewer.dims.set_current_step(0, viewer.dims.current_step[0] + 1)
+    assert controller.scrolling and layer.data_level == 0
+    controller.settle()
+    controller.wait_prefetch(30)
+    _tilecache.clear()
+    viewer.dims.set_current_step(0, viewer.dims.current_step[0] + 1)
+    assert layer.data_level > 0
+    controller.settle()
+
+
+def test_napari_dask_cache_is_off_while_luxendo_layers_are_open():
+    pytest.importorskip("napari")
+    from napari.utils import resize_dask_cache
+    from napari_luxendo._scroll import _DaskCacheSwitch
+
+    class Layer:
+        pass
+
+    resize_dask_cache(123_456_789)
+    switch, a, b = _DaskCacheSwitch(), Layer(), Layer()
+    switch.hold(a)
+    switch.hold(b)
+    assert resize_dask_cache().cache.available_bytes == 0
+    switch.release(a)
+    assert resize_dask_cache().cache.available_bytes == 0
+    switch.release(b)
+    assert resize_dask_cache().cache.available_bytes == 123_456_789

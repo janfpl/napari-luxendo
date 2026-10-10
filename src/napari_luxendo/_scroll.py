@@ -22,7 +22,11 @@ and would be slower, not faster.
 
 ``NAPARI_LUXENDO_SCROLL_PREVIEW=0`` turns it all off.
 ``NAPARI_LUXENDO_PREFETCH`` is the prefetch distance in screens (default 1,
-``0`` turns prefetching off).
+``0`` turns prefetching off). ``NAPARI_LUXENDO_PREFETCH_Z`` is how many
+planes above and below the view are prefetched too (default 2); a Z step onto
+one of them shows full detail at once instead of the coarse level.
+While Luxendo layers are open, napari's own Dask cache is turned off (see
+:class:`_DaskCacheSwitch`).
 """
 from __future__ import annotations
 
@@ -119,6 +123,7 @@ class ScrollPreview:
         self._coarse: "weakref.WeakSet[Any]" = weakref.WeakSet()
         self._tried: "weakref.WeakSet[Any]" = weakref.WeakSet()  # this scroll
         viewer.layers.events.inserted.connect(self._on_inserted)
+        viewer.layers.events.removed.connect(self._on_removed)
         viewer.camera.events.zoom.connect(self._on_zoom)
         viewer.camera.events.center.connect(self._on_pan)
         for layer in viewer.layers:
@@ -147,6 +152,12 @@ class ScrollPreview:
 
     def _on_inserted(self, event) -> None:
         self.track(event.value)
+
+    def _on_removed(self, event) -> None:
+        layer = event.value
+        if layer in self._layers:
+            self._layers.discard(layer)
+            _napari_dask_cache.release(layer)
 
     def track(self, layer) -> None:
         """Let *layer* use coarse levels while scrolling (Luxendo multiscale images)."""
@@ -180,6 +191,7 @@ class ScrollPreview:
         layer._update_draw = update_draw
         layer._luxendo_draw_state = state
         self._layers.add(layer)
+        _napari_dask_cache.hold(layer)
 
     def _on_slice(self, layer, dims) -> None:
         """A slice is about to be made: if a slider moved, go coarse first."""
@@ -192,10 +204,21 @@ class ScrollPreview:
             return
         self.scrolling = True
         self.prefetcher.cancel()
-        if layer not in self._tried:
+        if layer not in self._tried and not self._step_in_memory(layer, dims):
             self._go_coarse(layer)
         if self._restart is not None:
             self._restart()
+
+    def _step_in_memory(self, layer, dims) -> bool:
+        """True if the full-detail view at the new slider position is in the block cache."""
+        if layer in self._coarse or not layer.visible:
+            return False
+        try:
+            return region_in_memory(layer, layer.data_level, layer.corner_pixels,
+                                    _data_point(layer, dims))
+        except Exception as exc:
+            logger.debug('Scroll preview: %s', exc)
+            return False
 
     def _go_coarse(self, layer) -> None:
         state = getattr(layer, '_luxendo_draw_state', {})
@@ -298,6 +321,50 @@ def _no_refresh(*args, **kwargs) -> None:
     pass
 
 
+class _DaskCacheSwitch:
+    """Turns napari's opportunistic Dask cache off while Luxendo layers are open.
+
+    The block cache (:mod:`._tilecache`) already keeps what those layers show,
+    and napari's cache bookkeeping cost about 15 ms of every pan step. The
+    cache is a single process-wide object, so other Dask layers lose it too
+    while Luxendo data is open. Its previous size comes back when the last
+    Luxendo layer is removed. Nothing changes when the block cache is off
+    (``NAPARI_LUXENDO_TILE_CACHE_MB=0``) or with
+    ``NAPARI_LUXENDO_NAPARI_DASK_CACHE=1``.
+    """
+
+    def __init__(self) -> None:
+        self._holders: "weakref.WeakSet[Any]" = weakref.WeakSet()
+        self._saved: Optional[int] = None
+
+    def hold(self, layer) -> None:
+        self._holders.add(layer)
+        if self._saved is None and _tilecache.store() is not None \
+                and os.environ.get('NAPARI_LUXENDO_NAPARI_DASK_CACHE', '0') != '1':
+            try:
+                from napari.utils import resize_dask_cache
+
+                saved = int(resize_dask_cache().cache.available_bytes)
+                resize_dask_cache(0)
+                self._saved = saved
+            except Exception as exc:
+                logger.debug('napari Dask cache: %s', exc)
+
+    def release(self, layer) -> None:
+        self._holders.discard(layer)
+        if not self._holders and self._saved is not None:
+            saved, self._saved = self._saved, None
+            try:
+                from napari.utils import resize_dask_cache
+
+                resize_dask_cache(saved)
+            except Exception as exc:
+                logger.debug('napari Dask cache: %s', exc)
+
+
+_napari_dask_cache = _DaskCacheSwitch()
+
+
 def _coarse_threshold(shape_threshold):
     return tuple(max(1, int(s) // _SCROLL_DOWNSCALE) for s in shape_threshold)
 
@@ -313,29 +380,44 @@ def _single_plane(layer) -> bool:
     return all(m is not None and not np.any(np.nan_to_num(np.asarray(m, dtype=float))) for m in margins)
 
 
-def _plane_index(layer, level):
+def _plane_index(layer, level, point=None):
     """napari's index of the displayed plane at *level*: ints, and slice(None) on screen.
 
-    The same arithmetic as napari's image slice request: the data point,
-    divided by the level's downsampling, clipped to the level and rounded.
+    The same arithmetic as napari's image slice request: the data point
+    (*point*, or the one napari last sliced at), divided by the level's
+    downsampling, clipped to the level and rounded.
     """
     import numpy as np
 
-    point = np.asarray(layer._data_slice.point, dtype=float)
+    if point is None:
+        point = layer._data_slice.point
+    point = np.asarray(point, dtype=float)
     point = point / np.asarray(layer.downsample_factors[level], dtype=float)
     point = np.clip(point, 0, np.asarray(layer.level_shapes[level]) - 1)
     return [slice(None) if np.isnan(p) else int(np.round(p)) for p in point]
 
 
-def locate(layer, level):
-    """The cached source and plane napari shows *layer* at *level* from, or None."""
+def _data_point(layer, dims):
+    """The data point a slice at *dims* will show, NaN on the displayed axes."""
+    import numpy as np
+
+    point = np.asarray(layer.world_to_data(np.asarray(dims.point)[-layer.ndim:]), dtype=float)
+    point[list(layer._slice_input.displayed)] = np.nan
+    return point
+
+
+def locate(layer, level, point=None):
+    """The cached source and plane napari shows *layer* at *level* from, or None.
+
+    *point* is a data point to locate instead of the one last shown.
+    """
     if _tilecache.store() is None or not _single_plane(layer):
         return None
     array = layer.data[level]
     displayed = list(layer._slice_input.displayed)
     if displayed != [array.ndim - 2, array.ndim - 1]:
         return None  # only the usual (..., Y, X) display is prefetched
-    index = _plane_index(layer, level)
+    index = _plane_index(layer, level, point)
     memo = layer._luxendo_draw_state.setdefault('located', {})
     memo_key = (level, tuple(i for i in index if isinstance(i, int)))
     if memo_key not in memo:
@@ -350,9 +432,9 @@ def locate(layer, level):
     return memo[memo_key]
 
 
-def region_in_memory(layer, level, corners) -> bool:
+def region_in_memory(layer, level, corners, point=None) -> bool:
     """True if the on-screen part of *level* (napari corner pixels) is in the block cache."""
-    where = locate(layer, level)
+    where = locate(layer, level, point)
     if where is None:
         return False
     source, z = where
@@ -386,6 +468,16 @@ def prefetch_jobs(layer, screens: float):
             continue
         source, z = where
         shape = np.asarray(source.shape[1:])
+        if k == level:
+            # The view itself on the neighbouring planes, for Z steps.
+            vlo = np.clip(np.floor(view0[0] / factors[k]), 0, shape).astype(int)
+            vhi = np.clip(np.ceil(view0[1] / factors[k]), 0, shape).astype(int)
+            for dz in _z_offsets():
+                if not 0 <= z + dz < source.shape[0]:
+                    continue
+                for by in range(vlo[0] // b, -(-vhi[0] // b)):
+                    for bx in range(vlo[1] // b, -(-vhi[1] // b)):
+                        jobs.append((0.2 * abs(dz), _filler(source, z + dz, by, bx)))
         lo = np.clip(np.floor((view0[0] - screens * size0) / factors[k]), 0, shape).astype(int)
         hi = np.clip(np.ceil((view0[1] + screens * size0) / factors[k]), 0, shape).astype(int)
         for by in range(lo[0] // b, -(-hi[0] // b)):
@@ -395,6 +487,15 @@ def prefetch_jobs(layer, screens: float):
                 distance = float(np.max(np.abs(mid - centre0) / size0)) + 0.01 * (k - level)
                 jobs.append((distance, _filler(source, z, by, bx)))
     return jobs
+
+
+def _z_offsets():
+    """Neighbouring planes prefetched for the view (``NAPARI_LUXENDO_PREFETCH_Z``, default 2)."""
+    try:
+        n = max(0, int(os.environ.get('NAPARI_LUXENDO_PREFETCH_Z', '2')))
+    except ValueError:
+        n = 2
+    return [d for k in range(1, n + 1) for d in (k, -k)]
 
 
 def _filler(source, z, by, bx):

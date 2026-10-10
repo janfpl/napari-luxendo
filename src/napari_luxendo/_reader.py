@@ -159,11 +159,21 @@ def read_luxendo(
     views = _option(views, "NAPARI_LUXENDO_VIEWS", "ask", ("ask", "raw", "proc"))
 
     paths = [path] if isinstance(path, (str, Path)) else list(path)
-    collected: list[_View] = []
-    flat: list[LuxVolume] = []
     # Timepoints a main file or header lists, even if all their files are
     # missing, so the time axis keeps its frames in the right places.
     declared: set[int] = set()
+    collected = _collect_views(paths, views, declared)
+    if not collected:
+        raise ValueError("No readable Luxendo views found.")
+    return _build_layers(
+        collected, transform=transform, mosaic=tiles == "mosaic", declared_timepoints=declared,
+        paths=[str(p) for p in paths],
+    )
+
+
+def _collect_views(paths: list, views: str, declared: set[int]) -> list[_View]:
+    collected: list[_View] = []
+    flat: list[LuxVolume] = []
     for p in map(Path, paths):
         kind = _classify(p)
         if kind == "lux":
@@ -175,10 +185,29 @@ def read_luxendo(
         else:
             raise ValueError(f"{p.name}: not a Luxendo .lux.h5 file or header")
     collected.extend(_views_from_flat(flat))
-    if not collected:
-        raise ValueError("No readable Luxendo views found.")
+    return collected
+
+
+def read_tiles(layer_metadata: dict[str, Any]) -> list[LayerData]:
+    """One layer per tile of a mosaic layer the reader built.
+
+    *layer_metadata* is the mosaic layer's metadata. The tiles are read again
+    from the files the mosaic was opened from and placed the same way, on the
+    same time axis. Contrast limits are not sampled: the caller copies them
+    from the mosaic.
+    """
+    info = layer_metadata.get("tiles")
+    if not isinstance(info, dict):
+        raise ValueError("Not a Luxendo mosaic layer.")
+    wanted = [tuple(k) for k in info["series"]]
+    views = [v for v in _collect_views(info["paths"], info["views"], set())
+             if v.series in set(wanted)]
+    if not views:
+        raise ValueError("The mosaic's tiles could not be read again.")
+    views.sort(key=lambda v: wanted.index(v.series))
     return _build_layers(
-        collected, transform=transform, mosaic=tiles == "mosaic", declared_timepoints=declared
+        views, transform=info["transform"], mosaic=False,
+        declared_timepoints=set(layer_metadata.get("timepoints") or ()), contrast=False,
     )
 
 
@@ -359,6 +388,8 @@ def _build_layers(
     transform: str,
     mosaic: bool,
     declared_timepoints: set[int] | None = None,
+    paths: list[str] | None = None,
+    contrast: bool = True,
 ) -> list[LayerData]:
     series: OrderedDict[tuple, _Series] = OrderedDict()
     for v in views:
@@ -396,7 +427,7 @@ def _build_layers(
 
     color_keys = list(OrderedDict.fromkeys(s.first.color_key for s in series.values()))
     limits = {k: _contrast_for([s.reference for s in series.values() if s.first.color_key == k])
-              for k in color_keys}
+              for k in color_keys} if contrast else {}
     multi = len(plans) > 1
 
     layers = []
@@ -441,6 +472,15 @@ def _build_layers(
             voxel = ref.voxel_size_um
             scale = list(voxel) if voxel else [1.0, 1.0, 1.0]
             kwargs["scale"] = [1.0, *scale] if has_time else scale
+        if len(members) > 1 and paths:
+            # What the tiles widget needs to read the tiles again as separate layers.
+            group = first.group
+            kwargs["metadata"]["tiles"] = {
+                "paths": list(paths),
+                "transform": transform,
+                "views": group[3] if group[0] == "nested" and group[3] in ("raw", "proc") else "proc",
+                "series": [m.key for m in members],
+            }
         if limits.get(first.color_key) is not None:
             kwargs["contrast_limits"] = limits[first.color_key]
 

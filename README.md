@@ -261,8 +261,7 @@ directory must not hold the source files.
 - **Zooming and panning.** While you zoom, napari shows the same coarser level
   first and loads full detail 0.2 s after the zoom stops. A zoom into an area
   whose full detail is already in memory shows full detail straight away.
-  When the view stops, and while you drag, the area one screen around the
-  view is read into memory in the background at the displayed level and the
+  When the view stops, the area one screen around the view is read into memory in the background at the displayed level and the
   two coarser ones, so panning into it does not touch the disk. These blocks
   live in an in-memory cache of up to 1 GB, or a tenth of RAM if that is
   less, and the least recently shown blocks are dropped first. Nothing is

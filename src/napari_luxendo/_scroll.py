@@ -10,7 +10,7 @@ every pan step reads the newly visible area from disk. This controller:
   the camera zooms, and goes back to the level napari would pick once the
   view has been still for a moment. A zoom step whose full-detail area is
   already in memory is shown at full detail right away;
-* once the view stops, and during a drag, reads the area around the view
+* once the view stops, reads the area around the view
   (one screen in every direction by default) at the displayed level and the
   two coarser ones into the in-memory block cache (:mod:`._tilecache`) in a
   background thread, so a pan into it shows from memory.
@@ -136,9 +136,13 @@ class ScrollPreview:
             self._restart()
 
     def _on_pan(self, event=None) -> None:
-        """The camera moved: keep prefetching around it (a zoom also moves the centre)."""
-        if not self.moving:
-            self.prefetch()
+        """The camera moved: pause prefetching until it stops.
+
+        A prefetch read in flight holds the HDF5 library lock (and, for
+        compressed data, decompresses whole chunks), so it would delay the
+        display reads of the drag itself.
+        """
+        self.prefetcher.cancel()
         if self._restart is not None:
             self._restart()
 

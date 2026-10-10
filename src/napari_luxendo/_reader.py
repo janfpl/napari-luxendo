@@ -42,6 +42,7 @@ from ._lux import (
 from ._main import NestedView, is_nested_file, iter_nested_views, timepoint_index
 from ._mosaic import MosaicLayout, build_mosaic_levels, plan_layout, same_linear
 from ._preview import VolumeSource, preview_levels
+from ._scroll import install_current_viewer
 
 logger = logging.getLogger(__name__)
 
@@ -177,9 +178,11 @@ def read_luxendo(
     collected.extend(_views_from_flat(flat))
     if not collected:
         raise ValueError("No readable Luxendo views found.")
-    return _build_layers(
+    layers = _build_layers(
         collected, transform=transform, mosaic=tiles == "mosaic", declared_timepoints=declared
     )
+    install_current_viewer()
+    return layers
 
 
 def _warn(message: str) -> None:

@@ -240,18 +240,31 @@ directory must not hold the source files.
 - **Missing files** (moved, or not yet copied) are skipped with a warning.
   Their region stays empty.
 - **Performance without pyramids.** Large raw datasets get lazy display
-  overviews automatically. Opening needs no preprocessing or sidecar files;
-  zooming selects finer levels and level zero retains the original pixels.
-  Overviews use nearest-neighbour sampling, so small features may disappear
-  when zoomed out. Precomputed averaged pyramids remain preferable for
-  high-quality overview and 3D work. The initial view is a 2D slice; opening
+  overviews automatically. Opening needs no preprocessing, and nothing is
+  written next to the data; level zero keeps the original pixels. At first
+  the overviews are nearest-neighbour samples, which read as much from disk
+  per plane as full resolution. The first time one is shown, its levels are
+  averaged once in a background thread into a cache file in your user cache
+  folder (about 1/7 of the data size), and the display switches to it plane
+  by plane as it fills. Opening the same data again uses the finished cache
+  straight away. `NAPARI_LUXENDO_CACHE_DIR` moves the cache,
+  `NAPARI_LUXENDO_PYRAMID_CACHE=0` turns it off and
+  `NAPARI_LUXENDO_PREVIEW=0` disables generated display levels. Delete the
+  cache folder to reclaim the space. The initial view is a 2D slice; opening
   a 3D overview can still require substantial disk access.
-  `NAPARI_LUXENDO_PREVIEW=0` disables generated display levels.
+- **Scrolling through Z.** While a slider moves, napari shows a level about
+  two steps coarser and loads full detail once the slider has been still for
+  0.2 s. This only happens when the coarser level is cheap to read: a native
+  pyramid level or a finished overview cache. `NAPARI_LUXENDO_SCROLL_PREVIEW=0`
+  turns it off. napari's *Render Images Asynchronously* setting (Preferences >
+  Experimental) additionally keeps the slider responsive while planes load.
 - **Reading raw chunks.** Display requests read individual planes and crops.
   Uncompressed standard numeric HDF5 chunks use a read-only memory mapping,
   with every physical address obtained from the actual HDF5 chunk index.
-  Compressed and unsupported layouts use h5py. No offsets are guessed from
-  file order. `NAPARI_LUXENDO_DIRECT_IO=0` forces h5py for troubleshooting.
+  Compressed and unsupported layouts use h5py, with a 64 MB chunk cache per
+  file (`NAPARI_LUXENDO_H5_CACHE_MB`) so consecutive planes do not decompress
+  the same chunks again. No offsets are guessed from file order.
+  `NAPARI_LUXENDO_DIRECT_IO=0` forces h5py for troubleshooting.
 - **Contrast.** Initial contrast limits are the 0.05–99.95 percentiles of a
   small central block from up to six views of each channel, so loading never
   scans whole volumes.

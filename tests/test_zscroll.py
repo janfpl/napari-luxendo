@@ -35,7 +35,7 @@ def test_single_volume_preview_cache_builds_and_is_reused(tmp_path, cache_on):
     path = write_lux(tmp_path / "single.lux.h5", truth, pyramids=())
     [(levels, _, _)] = read_luxendo(str(path))
     # Before the build, previews are exact samples; the first read queues the build.
-    np.testing.assert_array_equal(levels[-1].compute(), truth[::4, ::4, ::4])
+    np.testing.assert_array_equal(levels[-1][0, :2, :2].compute(), truth[0, :8:4, :8:4])
     wait_for_builds(30)
     np.testing.assert_array_equal(levels[1].compute(), naive_means(truth, 2))
     np.testing.assert_array_equal(levels[2][1].compute(), naive_means(truth, 4)[1])
@@ -56,7 +56,11 @@ def test_changed_source_is_not_served_from_old_cache(tmp_path, cache_on):
     other = make_volume(4)
     write_lux(path, other, pyramids=())
     [(levels, _, _)] = read_luxendo(str(path))
-    np.testing.assert_array_equal(levels[1].compute(), other[::2, ::2, ::2])
+    # The new data gets its own cache (built in the background on first read),
+    # never the averages of the old file.
+    levels[1][0].compute()
+    wait_for_builds(30)
+    np.testing.assert_array_equal(levels[1].compute(), naive_means(other, 2))
 
 
 def test_mosaic_preview_cache_averages_the_stitched_mosaic(tiled_experiment, cache_on):

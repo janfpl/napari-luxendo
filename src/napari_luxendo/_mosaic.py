@@ -28,11 +28,12 @@ import numpy as np
 
 from ._lux import LuxVolume
 from ._preview import dataset_identity, preview_levels
+from ._tilecache import BLOCK_YX, CachedSource
 
 logger = logging.getLogger(__name__)
 
 # YX block edge of the mosaic dask array. Only requested Z planes are read.
-_BLOCK_YX = 512
+_BLOCK_YX = BLOCK_YX
 
 
 @dataclass
@@ -113,7 +114,7 @@ def build_mosaic_levels(
         source = _MosaicSource(shape, dtype, placed, voxel_um * f_arr)
         levels.append(
             da.from_array(
-                source, chunks=chunks, name='luxendo-mosaic-' + uuid.uuid4().hex,
+                CachedSource(source), chunks=chunks, name='luxendo-mosaic-' + uuid.uuid4().hex,
                 asarray=False, fancy=False, meta=np.empty((0, 0, 0), dtype=dtype),
             )
         )

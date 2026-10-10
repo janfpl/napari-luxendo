@@ -177,3 +177,11 @@ def tiled_experiment(tmp_path: Path) -> Path:
                         view["Data"] = h5py.ExternalLink(rel, "Data")
                         view["metadata"] = h5py.ExternalLink(rel, "metadata")
     return root
+
+
+def centre_sample(vol, factor):
+    """Nearest-neighbour preview of *vol*: the middle voxel of each block
+    (the last voxel of a clipped edge block)."""
+    idx = [np.minimum(np.arange(-(-n // factor)) * factor + factor // 2, n - 1)
+           for n in vol.shape]
+    return vol[np.ix_(*idx)]

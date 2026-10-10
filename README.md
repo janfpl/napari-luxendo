@@ -246,7 +246,10 @@ directory must not hold the source files.
   per plane as full resolution. The first time one is shown, its levels are
   averaged once in a background thread into a cache file in your user cache
   folder (about 1/7 of the data size), and the display switches to it plane
-  by plane as it fills. Opening the same data again uses the finished cache
+  by plane as it fills. The build pauses whenever the display is reading, so
+  it never slows a Z step. Compressed raw data is not cached (its reads need
+  h5py, which is not safe from a background thread) and keeps the samples.
+  Opening the same data again uses the finished cache
   straight away. `NAPARI_LUXENDO_CACHE_DIR` moves the cache,
   `NAPARI_LUXENDO_PYRAMID_CACHE=0` turns it off and
   `NAPARI_LUXENDO_PREVIEW=0` disables generated display levels. Delete the
@@ -256,7 +259,8 @@ directory must not hold the source files.
   two steps coarser and loads full detail once the slider has been still for
   0.2 s. This only happens when the coarser level is cheap to read: a native
   pyramid level or a finished overview cache. `NAPARI_LUXENDO_SCROLL_PREVIEW=0`
-  turns it off. napari's *Render Images Asynchronously* setting (Preferences >
+  turns it off. Coarse levels are drawn centred on the full-resolution pixels
+  they cover and fill the same bounds. napari's *Render Images Asynchronously* setting (Preferences >
   Experimental) additionally keeps the slider responsive while planes load.
 - **Reading raw chunks.** Display requests read individual planes and crops.
   Uncompressed standard numeric HDF5 chunks use a read-only memory mapping,

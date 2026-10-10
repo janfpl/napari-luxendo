@@ -8,7 +8,7 @@ import pytest
 
 from napari_luxendo import close_all, open_lux_volume, read_luxendo
 from napari_luxendo._fastio import ChunkReader, reader_for
-from conftest import make_volume, write_lux
+from conftest import centre_sample, make_volume, write_lux
 
 
 @pytest.mark.parametrize('dtype', ['<u2', '>u2', '<f4'])
@@ -104,9 +104,9 @@ def test_preview_is_sample_of_exact_mosaic_and_keeps_full_resolution(tiled_exper
     for levels,kw,_ in layers:
         full = levels[0].compute()
         for level,factor in zip(levels[1:],(2,4)):
-            np.testing.assert_array_equal(level.compute(),full[:,::factor,::factor,::factor])
-            np.testing.assert_array_equal(level[1,1,1:6,2:7].compute(),
-                                          full[1,::factor,::factor,::factor][1,1:6,2:7])
+            expected = np.stack([centre_sample(vol, factor) for vol in full])
+            np.testing.assert_array_equal(level.compute(),expected)
+            np.testing.assert_array_equal(level[1,1,1:6,2:7].compute(), expected[1,1,1:6,2:7])
         assert kw['multiscale']
         assert kw['metadata']['pyramid_levels'][0] == 'Data'
         assert 'nearest' in kw['metadata']['display_pyramid']
@@ -118,7 +118,7 @@ def test_single_volume_preview_and_disable(tmp_path,monkeypatch):
     path=write_lux(tmp_path/'single.lux.h5',truth,pyramids=())
     monkeypatch.setattr(preview,'preview_factors',lambda shape:[2,4])
     [(levels,kw,_)]=read_luxendo(str(path))
-    np.testing.assert_array_equal(levels[-1].compute(),truth[::4,::4,::4])
+    np.testing.assert_array_equal(levels[-1].compute(),centre_sample(truth,4))
     assert kw['multiscale']
 
 
@@ -180,4 +180,4 @@ def test_preview_metadata_when_native_levels_differ(lux_dir, monkeypatch):
         layers=read_luxendo(str(lux_dir/'dataset.ims'))
     levels,kw,_=layers[0]
     assert kw['metadata']['pyramid_levels']==['Data','preview_nearest_1','preview_nearest_2']
-    np.testing.assert_array_equal(levels[-1][1].compute(),make_volume(10)[::4,::4,::4])
+    np.testing.assert_array_equal(levels[-1][1].compute(),centre_sample(make_volume(10),4))

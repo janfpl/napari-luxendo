@@ -142,6 +142,15 @@ class _MosaicSource:
         key = tuple(slice(*s.indices(n)) for s, n in zip(key, self.shape))
         return _fill_region(key, self.dtype, self.placed, self.spacing)
 
+    def prepare_background(self):
+        """Ready every tile's reader; True if reads then make no h5py calls."""
+        ok = True
+        for p in self.placed:
+            if p.vol is not None and len(p.vol.datasets) > p.level:
+                reader = p.vol.reader(p.level)
+                ok = reader is not None and reader.prepare() and ok
+        return ok
+
     def cache_key(self):
         """Identity of the stitched pixels, for the on-disk preview cache."""
         return [list(self.shape), [float(s) for s in self.spacing]] + [

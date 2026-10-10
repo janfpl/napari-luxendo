@@ -94,6 +94,14 @@ def viewer_with_volume(tmp_path):
     return viewer, controller, layer, truth
 
 
+def _shown(layer, truth, z):
+    """Check the loaded full-resolution tile against *truth* wherever napari placed it."""
+    raw = np.asarray(layer._slice.image.raw)
+    ty, tx = (int(t) for t in layer._slice.tile_to_data.translate[-2:])
+    np.testing.assert_array_equal(raw, truth[z, ty:ty + raw.shape[0], tx:tx + raw.shape[1]])
+    return ty, tx, raw.shape
+
+
 def _draw(layer, y0, x0, size, threshold=(256, 256)):
     """Show full-resolution pixels [y0:y0+size, x0:x0+size] on a 256 x 256 canvas."""
     # World units: Y 0.5 um and X 0.4 um per voxel (conftest VOXEL).
@@ -116,8 +124,9 @@ def test_prefetch_loads_the_surroundings_of_the_view(viewer_with_volume):
     assert not source.has_region(z, 1600, 2048, 1600, 2048)
     # Panning into it shows the right pixels.
     _draw(layer, 850, 450, 200)
-    np.testing.assert_array_equal(np.asarray(layer._slice.image.raw),
-                                  truth[z, 850:1051, 450:651])
+    assert layer.data_level == 0
+    ty, tx, (h, w) = _shown(layer, truth, z)
+    assert ty <= 850 and tx <= 450 and ty + h >= 1051 and tx + w >= 651
 
 
 def test_prefetch_can_be_turned_off(viewer_with_volume, monkeypatch):
@@ -133,6 +142,8 @@ def test_prefetch_can_be_turned_off(viewer_with_volume, monkeypatch):
 
 
 def test_zoom_shows_coarse_level_first_unless_detail_is_in_memory(viewer_with_volume):
+    from napari_luxendo._scroll import locate
+
     viewer, controller, layer, truth = viewer_with_volume
     _draw(layer, 0, 0, 2048)  # whole plane: napari picks the coarsest level
     controller.settle()
@@ -145,8 +156,7 @@ def test_zoom_shows_coarse_level_first_unless_detail_is_in_memory(viewer_with_vo
     assert controller.zooming and layer.data_level > 0
     controller.settle()
     assert layer.data_level == 0
-    np.testing.assert_array_equal(np.asarray(layer._slice.image.raw),
-                                  truth[viewer.dims.current_step[0], 1700:1901, 1700:1901])
+    _shown(layer, truth, locate(layer, 0)[1])
     assert controller.wait_prefetch(30)
 
     # Zooming within what is now in memory goes straight to full detail.

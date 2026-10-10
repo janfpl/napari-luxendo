@@ -12,8 +12,8 @@ every pan step reads the newly visible area from disk. This controller:
   already in memory is shown at full detail right away;
 * once the view stops, reads the area around the view
   (one screen in every direction by default) at the displayed level and the
-  two coarser ones into the in-memory block cache (:mod:`._tilecache`) in a
-  background thread, so a pan into it shows from memory.
+  two coarser ones into the in-memory block cache (:mod:`._tilecache`) while
+  napari is idle, so a pan into it shows from memory.
 
 The coarser level is only used when it is cheap to read: a native pyramid
 level, or a generated preview whose on-disk cache is complete (see
@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import logging
 import os
-import queue
-import threading
+import time
 import weakref
+from collections import deque
 from typing import Any, Callable, Optional
 
 from . import _tilecache
@@ -138,8 +138,7 @@ class ScrollPreview:
     def _on_pan(self, event=None) -> None:
         """The camera moved: pause prefetching until it stops.
 
-        A prefetch read in flight holds the HDF5 library lock (and, for
-        compressed data, decompresses whole chunks), so it would delay the
+        Prefetch reads run between events, so they would compete with the
         display reads of the drag itself.
         """
         self.prefetcher.cancel()
@@ -254,7 +253,7 @@ class ScrollPreview:
         self.prefetch()
 
     def prefetch(self) -> None:
-        """Queue background reads of the area around the view, nearest first."""
+        """Queue idle-time reads of the area around the view, nearest first."""
         screens = prefetch_screens()
         if screens <= 0 or _tilecache.store() is None:
             return
@@ -303,16 +302,34 @@ def _coarse_threshold(shape_threshold):
     return tuple(max(1, int(s) // _SCROLL_DOWNSCALE) for s in shape_threshold)
 
 
+def _single_plane(layer) -> bool:
+    """True if napari shows one plane (newer napari projects a zero-thickness slab)."""
+    if str(getattr(layer.projection_mode, 'value', layer.projection_mode)) == 'none':
+        return True
+    data_slice = layer._data_slice
+    margins = [getattr(data_slice, n, None) for n in ('margin_left', 'margin_right')]
+    import numpy as np
+
+    return all(m is not None and not np.any(np.nan_to_num(np.asarray(m, dtype=float))) for m in margins)
+
+
 def _plane_index(layer, level):
-    """napari's index of the displayed plane at *level*: ints, and slice(None) on screen."""
-    request = layer._make_slice_request_internal(
-        slice_input=layer._slice_input, data_slice=layer._data_slice, dask_indexer=None)
-    return list(request._point_to_slices(request._thick_slice_at_level(level).point))
+    """napari's index of the displayed plane at *level*: ints, and slice(None) on screen.
+
+    The same arithmetic as napari's image slice request: the data point,
+    divided by the level's downsampling, clipped to the level and rounded.
+    """
+    import numpy as np
+
+    point = np.asarray(layer._data_slice.point, dtype=float)
+    point = point / np.asarray(layer.downsample_factors[level], dtype=float)
+    point = np.clip(point, 0, np.asarray(layer.level_shapes[level]) - 1)
+    return [slice(None) if np.isnan(p) else int(np.round(p)) for p in point]
 
 
 def locate(layer, level):
     """The cached source and plane napari shows *layer* at *level* from, or None."""
-    if _tilecache.store() is None or layer.projection_mode != 'none':
+    if _tilecache.store() is None or not _single_plane(layer):
         return None
     array = layer.data[level]
     displayed = list(layer._slice_input.displayed)
@@ -385,47 +402,62 @@ def _filler(source, z, by, bx):
 
 
 class Prefetcher:
-    """One background thread running the latest batch of reads; a new batch
-    (or :meth:`cancel`) abandons the rest of the previous one."""
+    """Runs the latest batch of reads on the GUI thread while napari is idle.
+
+    The reads are not done in a background thread: h5py releases the GIL
+    inside HDF5 reads while holding its library lock, and a GUI thread that
+    frees an h5py object at that moment can deadlock with it (seen with
+    h5py 3.14-3.16 when prefetching native pyramid levels). Instead, a
+    zero-interval Qt timer reads blocks for up to ``_BUDGET_S`` per event
+    loop pass, so input is handled between them. A new batch, or
+    :meth:`cancel`, drops the rest of the previous one. Without a Qt
+    application (scripts, tests) the reads run in :meth:`wait`.
+    """
+
+    _BUDGET_S = 0.010
 
     def __init__(self) -> None:
-        self._generation = 0
-        self._lock = threading.Lock()
-        self._queue: "queue.Queue" = queue.Queue()
-        self._idle = threading.Event()
-        self._idle.set()
-        self._thread: Optional[threading.Thread] = None
+        self._jobs: "deque[Callable[[], None]]" = deque()
+        self._timer = None
+        try:
+            from qtpy.QtCore import QTimer
+            from qtpy.QtWidgets import QApplication
+
+            if QApplication.instance() is not None:
+                self._timer = QTimer()
+                self._timer.setInterval(0)
+                self._timer.timeout.connect(self._tick)
+        except Exception:
+            self._timer = None
 
     def cancel(self) -> None:
-        with self._lock:
-            self._generation += 1
+        self._jobs.clear()
+        if self._timer is not None:
+            self._timer.stop()
 
     def schedule(self, jobs) -> None:
-        with self._lock:
-            self._generation += 1
-            if not jobs:
-                return
-            self._idle.clear()
-            self._queue.put((self._generation, jobs))
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._run, name='luxendo-prefetch',
-                                                daemon=True)
-                self._thread.start()
+        self._jobs = deque(jobs)
+        if self._timer is not None:
+            if self._jobs:
+                self._timer.start()
+            else:
+                self._timer.stop()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
-        return self._idle.wait(timeout)
+        """Run what is left now (benchmarks, tests, no Qt event loop)."""
+        self._run(None if timeout is None else time.perf_counter() + timeout)
+        return not self._jobs
 
-    def _run(self) -> None:
-        while True:
-            generation, jobs = self._queue.get()
-            for job in jobs:
-                if generation != self._generation:
-                    break
-                try:
-                    job()
-                except Exception as exc:  # a closed file, a removed layer
-                    logger.debug('Prefetch: %s', exc)
-                    break
-            with self._lock:
-                if self._queue.empty():
-                    self._idle.set()
+    def _tick(self) -> None:
+        self._run(time.perf_counter() + self._BUDGET_S)
+        if not self._jobs and self._timer is not None:
+            self._timer.stop()
+
+    def _run(self, deadline: Optional[float]) -> None:
+        while self._jobs and (deadline is None or time.perf_counter() < deadline):
+            job = self._jobs.popleft()
+            try:
+                job()
+            except Exception as exc:  # a closed file, a removed layer
+                logger.debug('Prefetch: %s', exc)
+                self._jobs.clear()

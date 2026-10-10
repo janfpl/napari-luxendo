@@ -11,7 +11,7 @@ least-recently-used store with a memory budget:
   the prefetcher asks for) is kept.
 * The view controller (:mod:`._scroll`) finds the source and plane napari
   shows with :func:`locate`, then prefetches whole blocks around the view
-  with :meth:`CachedSource.fill_block` in a background thread (no Dask
+  with :meth:`CachedSource.fill_block` while napari is idle (no Dask
   there) and checks with :meth:`CachedSource.has_region` whether a view is
   already in memory.
 

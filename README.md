@@ -261,8 +261,9 @@ directory must not hold the source files.
 - **Zooming and panning.** While you zoom, napari shows the same coarser level
   first and loads full detail 0.2 s after the zoom stops. A zoom into an area
   whose full detail is already in memory shows full detail straight away.
-  When the view stops, the area one screen around the view is read into memory in the background at the displayed level and the
-  two coarser ones, so panning into it does not touch the disk. These blocks
+  When the view stops, the area one screen around it is read into memory
+  at the displayed level and the two coarser ones, a block at a time while
+  napari is idle, so panning into it does not touch the disk. These blocks
   live in an in-memory cache of up to 1 GB, or a tenth of RAM if that is
   less, and the least recently shown blocks are dropped first. Nothing is
   written to disk. `NAPARI_LUXENDO_TILE_CACHE_MB` sets the memory budget

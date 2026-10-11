@@ -34,6 +34,9 @@ def test_read_tiles_gives_one_layer_per_tile(tiled_experiment):
     assert kind == "image" and data[0].shape == (2, *TILE)
     np.testing.assert_array_equal(np.asarray(data[0][1]), ground_truth(1, 1)[:, :TILE[1], :TILE[2]])
     assert "tiles" not in kwargs["metadata"]
+    # Tiles are tracked by the scroll controller and centred like the mosaic.
+    assert "luxendo" in kwargs["metadata"]
+    assert kwargs["metadata"]["pyramid_factors"] == mosaic[1]["metadata"]["pyramid_factors"]
 
 
 def test_unstitch_then_stitch_restores_the_mosaic(viewer):

@@ -9,12 +9,14 @@ by plane as it fills. No sidecar files are written next to the data.
 """
 from __future__ import annotations
 
+import itertools
 import os
 import uuid
 
 import dask.array as da
 import numpy as np
 
+from ._fastio import note_foreground_read
 from ._preview_cache import PreviewCache
 
 
@@ -45,6 +47,11 @@ class VolumeSource:
     def cache_key(self):
         return [dataset_identity(self.vol.datasets[0])]
 
+    def prepare_background(self):
+        """Ready the reader; True if reads then make no h5py calls (see ._fastio)."""
+        reader = self.vol.reader(0)
+        return reader is not None and reader.prepare()
+
 
 def dataset_identity(ds):
     """What identifies the pixels of an HDF5 dataset across sessions."""
@@ -63,15 +70,30 @@ class SampledSource:
         self.cache, self.level = cache, level
 
     def __getitem__(self, key):
+        note_foreground_read()
         if self.cache is not None:
             cached = self.cache.read(self.level, key)
             if cached is not None:
                 return cached
-        mapped = []
+        # Sample each block at its middle, the centre the display puts it at
+        # (see ._center). A clipped last block is sampled at its last pixel.
+        f, mid = self.factor, self.factor // 2
+        parts = []
         for s, n, full in zip(key, self.shape, self.source.shape):
             start, stop, step = s.indices(n)
-            mapped.append(slice(start*self.factor, min(stop*self.factor, full), step*self.factor))
-        return self.source[tuple(mapped)]
+            count = len(range(start, stop, step))
+            first = start * f + mid
+            inside = max(0, min(count, -(-(full - first) // (step * f))))
+            axis = [(slice(first, first + max(inside - 1, 0) * step * f + 1, step * f),
+                     slice(0, inside))] if inside else []
+            if inside < count:
+                axis.append((slice(full - 1, full), slice(inside, count)))
+            parts.append(axis)
+        out = np.empty(tuple(len(range(*s.indices(n))) for s, n in zip(key, self.shape)),
+                       dtype=self.dtype)
+        for combo in itertools.product(*parts):
+            out[tuple(d for _, d in combo)] = self.source[tuple(src for src, _ in combo)]
+        return out
 
 
 def preview_levels(source):

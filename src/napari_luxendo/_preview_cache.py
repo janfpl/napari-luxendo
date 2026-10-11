@@ -115,6 +115,11 @@ def wait_for_builds(timeout: float | None = None) -> None:
         cache.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
 
 
+def building_caches() -> list[PreviewCache]:
+    """Caches whose build is queued or running, in the order they were opened."""
+    return [cache for cache in list(_CACHES.values()) if cache.building]
+
+
 def close_caches() -> None:
     """Close cache files; running builds stop at the next brick."""
     for cache in list(_CACHES.values()):
@@ -143,6 +148,9 @@ class PreviewCache:
         self.ready = False
         self.failed = False
         self.done_z = 0  # full-resolution planes whose cached planes are written
+        self.nbytes = self._offsets()[1]  # size of the finished cache file
+        self.paused = False  # the builder is waiting for the display to stop reading
+        self._done_voxels = 0  # full-resolution voxels averaged so far
         self._lock = threading.RLock()
         self._maps: list[np.memmap] = []
         self._started = False
@@ -196,6 +204,19 @@ class PreviewCache:
             except Exception as exc:  # never break the display over the cache
                 logger.debug('Preview cache read failed: %s', exc)
                 return None
+
+    @property
+    def building(self) -> bool:
+        """True from the moment the build is queued until it finishes or stops."""
+        return self._started and not self._finished.is_set() and not self._closed
+
+    @property
+    def fraction_built(self) -> float:
+        """Share of the source averaged so far, 0 to 1 (1 once ready)."""
+        if self.ready:
+            return 1.0
+        total = int(np.prod(self.source.shape))
+        return min(1.0, self._done_voxels / total) if total else 1.0
 
     def wait(self, timeout: float | None = None) -> bool:
         if not self._started and not self.ready:
@@ -317,7 +338,9 @@ class PreviewCache:
         while not self._closed:
             idle = seconds_since_foreground_read()
             if idle >= _IDLE_S:
+                self.paused = False
                 return
+            self.paused = True
             time.sleep(_IDLE_S - idle)
 
     def _fill(self, maps) -> None:
@@ -337,6 +360,7 @@ class PreviewCache:
                     for m, f, mean in zip(maps, self.factors, block_means(brick, self.factors)):
                         m[z0 // f: z0 // f + mean.shape[0], y0 // f: y0 // f + mean.shape[1],
                           x0 // f: x0 // f + mean.shape[2]] = mean
+                    self._done_voxels += brick.size
             with self._lock:
                 self.done_z = z1
 

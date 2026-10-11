@@ -246,7 +246,9 @@ directory must not hold the source files.
   per plane as full resolution. The first time one is shown, its levels are
   averaged once in a background thread into a cache file in your user cache
   folder (about 1/7 of the data size), and the display switches to it plane
-  by plane as it fills. The build pauses whenever the display is reading, so
+  by plane as it fills. While it builds, napari's activity panel (bottom
+  right) shows the cache size and how much is done, e.g. "Overview cache:
+  35% of 528 MB built". The build pauses whenever the display is reading, so
   it never slows a Z step. Compressed raw data is not cached (its reads need
   h5py, which is not safe from a background thread) and keeps the samples.
   Opening the same data again uses the finished cache

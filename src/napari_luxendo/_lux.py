@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import uuid
@@ -39,6 +40,19 @@ _OPEN_FILES: dict[str, Any] = {}
 _OPEN_LOCK = threading.Lock()
 
 
+def _chunk_cache_bytes() -> int:
+    """HDF5 chunk cache per file, from ``NAPARI_LUXENDO_H5_CACHE_MB`` (default 64).
+
+    h5py's 1 MiB default holds two 64^3 uint16 chunks, so compressed data
+    (which cannot use the direct reader) decompressed every chunk again for
+    each Z plane. 64 MiB keeps the chunks under a 512x512 display block.
+    """
+    try:
+        return max(0, int(float(os.environ.get("NAPARI_LUXENDO_H5_CACHE_MB", "64")) * 2**20))
+    except ValueError:
+        return 64 * 2**20
+
+
 def open_h5(path: Path | str) -> Any:
     """Open (or reuse) a read-only h5py handle for *path*."""
     import h5py
@@ -47,7 +61,7 @@ def open_h5(path: Path | str) -> Any:
     with _OPEN_LOCK:
         f = _OPEN_FILES.get(key)
         if f is None or not f.id.valid:
-            f = h5py.File(key, "r")
+            f = h5py.File(key, "r", rdcc_nbytes=_chunk_cache_bytes(), rdcc_nslots=100_003)
             _OPEN_FILES[key] = f
         return f
 
@@ -58,6 +72,9 @@ def close_all() -> None:
     Any layer still backed by those files will fail to read afterwards, so
     only call this once the layers are gone.
     """
+    from ._preview_cache import close_caches
+
+    close_caches()
     close_readers()
     with _OPEN_LOCK:
         for f in _OPEN_FILES.values():
@@ -237,6 +254,8 @@ class LuxVolume:
     datasets: list[Any] = field(default_factory=list)  # h5py dataset per level
     factors: list[tuple[int, int, int]] = field(default_factory=list)  # (z, y, x) per level
     view_name: str | None = None  # group name inside a nested/main file
+    _readers: dict[int, Any] = field(default_factory=dict, init=False, repr=False,
+                                     compare=False)
 
     @property
     def data(self) -> da.Array:
@@ -266,10 +285,23 @@ class LuxVolume:
 
     def read(self, level: int, region: tuple[slice, slice, slice]) -> np.ndarray:
         """Read a ``(z, y, x)`` region of *level* straight from HDF5."""
-        ds = self.datasets[level]
-        if ds.ndim == 2:
+        reader = self.reader(level)
+        if reader is None:
+            ds = self.datasets[level]
             return np.asarray(ds[region[1], region[2]])[np.newaxis][region[0]]
-        return reader_for(ds)[region]
+        return reader[region]
+
+    def reader(self, level: int):
+        """The chunk reader of a 3D *level* (None for a 2D one), looked up once.
+
+        Later reads then need no h5py call to find it (see :mod:`._fastio`).
+        """
+        try:
+            return self._readers[level]
+        except KeyError:
+            ds = self.datasets[level]
+            reader = self._readers[level] = None if ds.ndim == 2 else reader_for(ds)
+            return reader
 
 
 def _strip_ext(name: str) -> str:

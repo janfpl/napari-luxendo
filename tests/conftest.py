@@ -17,7 +17,11 @@ DESCRIPTIONS = ["Green-488", "Red-561"]
 
 
 @pytest.fixture(autouse=True)
-def _close_handles():
+def _close_handles(monkeypatch, tmp_path_factory):
+    # Previews stay exact nearest-neighbour samples unless a test turns the
+    # background cache on; never write into the real user cache directory.
+    monkeypatch.setenv("NAPARI_LUXENDO_PYRAMID_CACHE", "0")
+    monkeypatch.setenv("NAPARI_LUXENDO_CACHE_DIR", str(tmp_path_factory.mktemp("preview-cache")))
     yield
     lux.close_all()
 
@@ -173,3 +177,11 @@ def tiled_experiment(tmp_path: Path) -> Path:
                         view["Data"] = h5py.ExternalLink(rel, "Data")
                         view["metadata"] = h5py.ExternalLink(rel, "metadata")
     return root
+
+
+def centre_sample(vol, factor):
+    """Nearest-neighbour preview of *vol*: the middle voxel of each block
+    (the last voxel of a clipped edge block)."""
+    idx = [np.minimum(np.arange(-(-n // factor)) * factor + factor // 2, n - 1)
+           for n in vol.shape]
+    return vol[np.ix_(*idx)]

@@ -459,3 +459,42 @@ def test_crop_without_sample_affine_keeps_origin(tmp_path):
     np.testing.assert_allclose(
         vol.affine[:3, 3], layer.data_to_world([0, 1, 2, 3])[1:]
     )
+
+
+def _plane_bytes(path):
+    if path.is_dir():
+        return {p.name: p.read_bytes() for p in sorted(path.iterdir())}
+    return path.read_bytes()
+
+
+@pytest.mark.parametrize("fmt", [_export.FORMAT_LUX_H5, FORMAT_TIFF, FORMAT_OME_TIFF, FORMAT_JPEG])
+def test_cancelled_overwrite_keeps_previous_export(tmp_path, small_slabs, fmt):
+    run_export(plan_export([_source(timepoints=(0,), seed=1)], tmp_path, fmt))
+    plan = plan_export([_source(timepoints=(0,), seed=2)], tmp_path, fmt)
+    out = plan.jobs[0].output
+    before = _plane_bytes(out)
+    calls = iter([False] * 2)
+    assert run_export(plan, cancel_check=lambda: next(calls, True)) is None
+    assert _plane_bytes(out) == before
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".")]
+
+    run_export(plan)
+    assert _plane_bytes(out) != before
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".")]
+
+
+def test_failed_overwrite_keeps_previous_export(tmp_path, monkeypatch):
+    run_export(plan_export([_source(timepoints=(0,), seed=1)], tmp_path, FORMAT_TIFF))
+    plan = plan_export([_source(timepoints=(0,), seed=2)], tmp_path, FORMAT_TIFF)
+    before = plan.jobs[0].output.read_bytes()
+
+    def broken(job, *args):
+        job.output.write_bytes(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setitem(_export._WRITERS, FORMAT_TIFF, broken)
+    with pytest.raises(OSError):
+        run_export(plan)
+    assert plan.jobs[0].output.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        [plan.jobs[0].output.name, SUMMARY_FILENAME])

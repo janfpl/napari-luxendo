@@ -317,3 +317,54 @@ def test_64_bit_integers_get_no_averaged_cache(cache_on):
 
     assert PreviewCache.for_source(Source(np.uint64), [2]) is None
     assert PreviewCache.for_source(Source(np.int64), [2]) is None
+
+
+def test_cache_reports_size_and_progress(tmp_path, cache_on):
+    from napari_luxendo._preview import preview_caches
+    from napari_luxendo._preview_cache import building_caches
+
+    truth = make_volume(3)
+    path = write_lux(tmp_path / "single.lux.h5", truth, pyramids=())
+    [(levels, _, _)] = read_luxendo(str(path))
+    [cache] = preview_caches(levels[1])
+    assert cache.fraction_built == 0 and not cache.building
+    levels[1][0].compute()  # queues the build
+    wait_for_builds(30)
+    assert cache.ready and cache.fraction_built == 1 and not cache.building
+    assert cache not in building_caches()
+    assert cache.nbytes == cache.path.stat().st_size > 0
+
+
+def test_progress_bars_follow_cache_builds(monkeypatch):
+    pytest.importorskip("napari")
+    from napari.utils import progress
+    import napari_luxendo._cache_progress as cache_progress
+
+    class Cache:  # what the bars read from a PreviewCache
+        nbytes, paused, fraction_built = 528 * 2**20, False, 0.0
+
+    cache = Cache()
+    building = [cache]
+    monkeypatch.setattr(cache_progress, "building_caches", lambda: list(building))
+    bars = cache_progress.CacheProgress()
+    bars.poll()
+    [bar] = bars._bars.values()
+    assert bar in progress._all_instances
+    assert bar.desc == "Overview cache: 0% of 528 MB built" and bar.n == 0
+
+    cache.fraction_built, cache.paused = 0.357, True
+    bars.poll()
+    assert bar.n == 35
+    assert bar.desc.rstrip(": ") == \
+        "Overview cache: 35% of 528 MB built (paused while the display reads)"
+
+    building.clear()  # finished, failed or closed
+    bars.poll()
+    assert not bars._bars and bar not in progress._all_instances
+
+
+def test_format_size():
+    from napari_luxendo._cache_progress import format_size
+    assert format_size(528 * 2**20) == "528 MB"
+    assert format_size(int(3.44 * 2**30)) == "3.4 GB"
+    assert format_size(512) == "512 B"

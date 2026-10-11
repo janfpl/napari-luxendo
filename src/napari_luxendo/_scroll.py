@@ -21,6 +21,7 @@ import os
 import weakref
 from typing import Any, Callable, Optional
 
+from . import _cache_progress
 from ._center import center_levels
 from ._preview import level_is_cheap
 
@@ -49,6 +50,7 @@ def install_current_viewer() -> None:
         return
     if viewer is not None:
         install(viewer, timer=_qt_timer())
+        _cache_progress.install()
 
 
 def install(viewer, timer: Optional[Callable[[Callable[[], None]], Callable[[], None]]] = None):

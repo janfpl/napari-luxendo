@@ -290,14 +290,15 @@ class ExportWidget(QWidget):
         lay.addWidget(self.chk_write_header)
 
         row_meta = QHBoxLayout()
-        row_meta.addWidget(QLabel("Metadata summary:"))
+        row_meta.addWidget(QLabel("Metadata files:"))
         self.combo_metadata = QComboBox()
         self.combo_metadata.addItem("JSON", METADATA_JSON)
         self.combo_metadata.addItem("JSON + TXT", METADATA_TXT)
         self.combo_metadata.addItem("JSON + CSV", METADATA_CSV)
         self.combo_metadata.setToolTip(
-            "luxendo_export.json is always written. TXT and CSV add a copy with one "
-            "key and value per line."
+            "luxendo_export.json and, for each layer, <layer>.metadata.json (the "
+            "Luxendo metadata stored in the source .h5) are always written. TXT and "
+            "CSV add a copy of each with one key and value per line."
         )
         row_meta.addWidget(self.combo_metadata, 1)
         lay.addLayout(row_meta)

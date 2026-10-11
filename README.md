@@ -222,9 +222,10 @@ Options:
   JSON file the same way.
 - **Luxendo metadata sidecar**: every layer also gets `<layer>.metadata.json`
   next to its outputs, in every format. It is the JSON `metadata` dataset of
-  the layer's source `.lux.h5`, unchanged (for a mosaic or a time series, the
-  first tile and timepoint). The TXT / CSV choice above adds
-  `<layer>.metadata.txt` / `.csv` too.
+  the layer's source `.lux.h5`, unchanged (for a time series, the first
+  timepoint). A stitched mosaic gets one `<layer>_<tile>.metadata.json` per
+  tile instead, each with that tile's own JSON. The TXT / CSV choice above adds
+  a `.txt` / `.csv` copy of every sidecar.
 
 An exported `.lux.h5` holds `Data`, the pyramid levels and the source's JSON
 metadata with `image_size_vx`, `time_point` and `affine_to_sample` rewritten

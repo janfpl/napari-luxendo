@@ -124,6 +124,8 @@ def export_source(layer: Any, roi: Optional[Roi] = None) -> ExportSource:
         affine_zyx=_spatial(affine),
         voxel_size_um=tuple(float(v) for v in voxel) if voxel else None,
         metadata=md.get("luxendo") or {},
+        tile_metadata=[(t.get("view", ""), t.get("luxendo") or {})
+                       for t in md.get("tile_metadata") or []],
         color=_color(layer),
         contrast_limits=_contrast_limits(layer),
         fused_views=max(1, len(md.get("views") or [])),

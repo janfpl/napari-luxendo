@@ -154,6 +154,9 @@ class PreviewCache:
     @classmethod
     def for_source(cls, source, factors):
         """The shared cache for *source*, or None if it cannot or should not be cached."""
+        dtype = np.dtype(source.dtype)
+        if dtype.kind in 'iu' and dtype.itemsize == 8:
+            return None  # block sums overflow 64-bit integers; sample instead
         if not cache_enabled() or not hasattr(source, 'cache_key'):
             return None
         try:

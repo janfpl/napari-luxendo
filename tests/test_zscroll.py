@@ -248,3 +248,72 @@ def test_cache_builder_waits_while_the_display_reads(tmp_path, cache_on):
     worker.start()
     worker.join(5)
     assert done and done[0] < preview_cache._IDLE_S / 2
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_coarse_plane_uses_true_factor_when_levels_are_ragged(tmp_path, monkeypatch, native):
+    # 1001 planes at factor 4 make a 251-plane level: napari's shape ratio is
+    # 3.988, which drifts by a whole block before the last plane.
+    pytest.importorskip("napari")
+    import napari_luxendo._preview as preview
+    from napari.components import ViewerModel
+    from napari.layers import Layer
+    from napari_luxendo._scroll import install
+
+    nz = 1001
+    truth = np.broadcast_to(np.arange(nz, dtype=np.uint16)[:, None, None], (nz, 24, 24)).copy()
+    if native:
+        path = write_lux(tmp_path / "pyr.lux.h5", truth, pyramids=((4, 4, 4),))
+    else:
+        monkeypatch.setattr(preview, "preview_factors", lambda shape: [4])
+        path = write_lux(tmp_path / "raw.lux.h5", truth, pyramids=())
+    viewer = ViewerModel()
+    controller = install(viewer)
+    layer = Layer.create(*read_luxendo(str(path))[0])
+    viewer.add_layer(layer)
+    controller.settle()
+    assert layer.metadata["pyramid_factors"] == [[1, 1, 1], [4, 4, 4]]
+    corners = np.array([[0.0, 0.0], [1000.0, 1000.0]])
+    for z in range(0, nz, 7):
+        viewer.dims.set_current_step(0, z)
+        layer._update_draw(scale_factor=1.0, corner_pixels_displayed=corners, shape_threshold=(4, 4))
+        assert layer.data_level == 1
+        shown = int(np.asarray(layer._slice.image.raw)[0, 0])
+        assert z // 4 * 4 <= shown <= z // 4 * 4 + 3, (z, shown)
+    np.testing.assert_allclose(layer._transforms['tile2data'].scale[1:], [4, 4])
+
+
+def test_scroll_controller_does_not_keep_viewer_alive(tmp_path):
+    pytest.importorskip("napari")
+    import gc
+    import weakref
+    from napari.components import ViewerModel
+    from napari.layers import Layer
+    from napari_luxendo import _scroll
+
+    path = write_lux(tmp_path / "pyr.lux.h5", make_volume(1), pyramids=((2, 2, 2),))
+    viewer = ViewerModel()
+    controller = _scroll.install(viewer)
+    viewer.add_layer(Layer.create(*read_luxendo(str(path))[0]))
+    viewer.dims.set_current_step(0, 3)
+    controller.settle()
+    ref = weakref.ref(viewer)
+    del viewer, controller
+    gc.collect()
+    assert ref() is None
+
+
+def test_64_bit_integers_get_no_averaged_cache(cache_on):
+    from napari_luxendo._preview_cache import PreviewCache
+
+    class Source:
+        shape, ndim = (16, 16, 16), 3
+
+        def __init__(self, dtype):
+            self.dtype = np.dtype(dtype)
+
+        def cache_key(self):
+            return ["64-bit"]
+
+    assert PreviewCache.for_source(Source(np.uint64), [2]) is None
+    assert PreviewCache.for_source(Source(np.int64), [2]) is None

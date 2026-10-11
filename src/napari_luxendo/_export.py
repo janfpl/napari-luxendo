@@ -24,10 +24,12 @@ This module does not import napari or Qt.
 from __future__ import annotations
 
 import copy
+import os
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
@@ -484,7 +486,6 @@ def _write_jpeg(job: ExportJob, chunk_z: int, progress: ProgressCallback,
                 cancel_check: Optional[CancelCheck]) -> None:
     from PIL import Image
 
-    _remove_jpeg_planes(job.output)  # don't leave planes of a deeper earlier export
     job.output.mkdir(parents=True, exist_ok=True)
     paths = jpeg_plane_paths(job)
     limits = jpeg_contrast_limits(job.source)
@@ -502,6 +503,20 @@ def _remove_output(job: ExportJob) -> None:
         _remove_jpeg_planes(job.output)
     else:
         job.output.unlink(missing_ok=True)
+
+
+def _publish(staged: Path, output: Path) -> None:
+    """Move a finished *staged* file or JPEG folder to *output*, replacing an earlier export."""
+    if not staged.is_dir():
+        os.replace(staged, output)
+        return
+    # A folder can't replace a non-empty folder: swap its plane files instead,
+    # keeping unrelated files and dropping planes of a deeper earlier export.
+    _remove_jpeg_planes(output)
+    output.mkdir(parents=True, exist_ok=True)
+    for f in staged.iterdir():
+        os.replace(f, output / f.name)
+    staged.rmdir()
 
 
 def _write_lux_h5(job: ExportJob, chunk_z: int, progress: ProgressCallback,
@@ -556,7 +571,8 @@ def run_export(
         Called with ``(bytes_written, total_bytes)`` across all files.
     cancel_check : callable, optional
         Polled before each slab; return True to stop. The partially written file
-        is deleted; files already finished are kept.
+        is deleted; files already finished are kept, and so is an earlier export
+        the cancelled file would have replaced.
 
     Returns
     -------
@@ -575,14 +591,18 @@ def run_export(
             if progress_callback:
                 progress_callback(base + done, total)
 
+        # Write next to the destination and swap it in only once complete, so a
+        # cancelled or failed overwrite keeps the previous export.
+        staged = replace(job, output=job.output.with_name(f".{uuid.uuid4().hex}.{job.output.name}"))
         try:
-            writer(job, _chunk_z(job, ram_percent), _progress, cancel_check)
+            writer(staged, _chunk_z(job, ram_percent), _progress, cancel_check)
+            _publish(staged.output, job.output)
         except _Cancelled:
-            _remove_output(job)  # the writer has closed it by now
+            _remove_output(staged)  # the writer has closed it by now
             logger.info("Export cancelled during %s", job.output.name)
             return None
         except BaseException:
-            _remove_output(job)  # never leave a truncated file behind
+            _remove_output(staged)  # never leave a truncated file behind
             raise
         finished += job.output_bytes
         if progress_callback:

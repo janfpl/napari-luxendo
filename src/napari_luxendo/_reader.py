@@ -41,6 +41,7 @@ from ._lux import (
 )
 from ._main import NestedView, is_nested_file, iter_nested_views, timepoint_index
 from ._mosaic import MosaicLayout, build_mosaic_levels, plan_layout, same_linear
+from . import _preview
 from ._preview import VolumeSource, preview_levels
 from ._scroll import install_current_viewer
 
@@ -447,6 +448,12 @@ def _build_layers(
         if limits.get(first.color_key) is not None:
             kwargs["contrast_limits"] = limits[first.color_key]
 
+        # True downsampling per level, for drawing coarse levels (see ._center).
+        spatial_factors = [tuple(f) for f in ref.factors[:native_count]]
+        if len(levels) > native_count:
+            spatial_factors += [(f, f, f) for f in _preview.preview_factors(levels[0].shape[-3:])]
+        kwargs["metadata"]["pyramid_factors"] = [[1, *f] if has_time else list(f)
+                                                 for f in spatial_factors]
         data = levels if len(levels) > 1 else levels[0]
         native_levels = len(kwargs['metadata']['pyramid_levels'])
         if len(levels) > native_levels:

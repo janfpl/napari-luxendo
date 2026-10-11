@@ -87,7 +87,8 @@ class ScrollPreview:
     """
 
     def __init__(self, viewer, timer=None) -> None:
-        self.viewer = viewer
+        # Weak: _CONTROLLERS is keyed weakly by the viewer and must not keep it alive.
+        self._viewer_ref = weakref.ref(viewer)
         self.scrolling = False
         self._restart = timer(self.settle) if timer is not None else None
         self._layers: "weakref.WeakSet[Any]" = weakref.WeakSet()
@@ -96,6 +97,13 @@ class ScrollPreview:
         viewer.layers.events.inserted.connect(self._on_inserted)
         for layer in viewer.layers:
             self.track(layer)
+
+    @property
+    def viewer(self):
+        viewer = self._viewer_ref()
+        if viewer is None:
+            raise RuntimeError('Viewer has been closed')
+        return viewer
 
     def _on_inserted(self, event) -> None:
         self.track(event.value)

@@ -85,12 +85,28 @@ def _wrap_request(layer, method):
     def make_slice_request_internal(*args, **kwargs):
         request = method(*args, **kwargs)
         try:
+            _use_true_factors(layer, request)
             _center_planes(request)
         except Exception as exc:  # never break slicing
             logger.debug('Centering coarse plane: %s', exc)
         return request
 
     return make_slice_request_internal
+
+
+def _use_true_factors(layer, request) -> None:
+    """Give *request* the reader's downsampling factors instead of napari's shape ratios.
+
+    napari divides level shapes (13 planes over 4 gives 3.25, not 4), which is
+    wrong whenever a level ends in a partial block, and picks the wrong plane
+    and scale from there on.
+    """
+    factors = layer.metadata.get('pyramid_factors')
+    if factors is None:
+        return
+    factors = np.asarray(factors, dtype=float)
+    if factors.shape == np.shape(request.downsample_factors):
+        object.__setattr__(request, 'downsample_factors', factors)
 
 
 def _center_planes(request) -> None:

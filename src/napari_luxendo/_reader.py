@@ -458,6 +458,15 @@ def _build_layers(
                 "source": first.source,
                 "path": str(ref.path),
                 "files": sorted({str(v.path) for s in members for v in s.by_time.values()}),
+                # Every source view's own Luxendo JSON, per timepoint, so each
+                # exported frame describes its own files. An empty list marks a
+                # frame shown as zeros because no file holds it.
+                "metadata_by_timepoint": {
+                    t: [{"view": v.view_name or v.path.name, "file": str(v.path),
+                         "luxendo": v.metadata.get("raw", {})}
+                        for s in members if (v := s.by_time.get(t)) is not None]
+                    for t in timepoints
+                },
                 "views": [s.reference.view_name or s.reference.path.name for s in members],
                 # Each stitched tile's own Luxendo JSON, for per-tile metadata export.
                 "tile_metadata": [

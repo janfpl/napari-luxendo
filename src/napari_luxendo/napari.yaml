@@ -11,11 +11,16 @@ contributions:
     - id: napari-luxendo.export_widget
       python_name: napari_luxendo._export_widget:ExportWidget
       title: Export Luxendo layers (.lux.h5 / TIFF / JPEG)
+    - id: napari-luxendo.tiles_widget
+      python_name: napari_luxendo._tiles_widget:TilesWidget
+      title: Luxendo tiles
   widgets:
     - command: napari-luxendo.coordinates_widget
       display_name: Luxendo coordinates
     - command: napari-luxendo.export_widget
       display_name: Export (.lux.h5 / TIFF / JPEG)
+    - command: napari-luxendo.tiles_widget
+      display_name: Luxendo tiles
   readers:
     - command: napari-luxendo.get_reader
       accepts_directories: false

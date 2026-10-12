@@ -21,12 +21,14 @@ from napari_luxendo._export import (
     SUMMARY_FILENAME,
     ExportSource,
     affine_to_luxendo,
+    export_metadata,
     flatten_json,
     jpeg_plane_paths,
     plan_export,
     run_export,
 )
 from napari_luxendo._lux import compose_affine_to_sample
+from napari_luxendo._spec import missing_fields, to_spec
 
 from conftest import VX, ground_truth
 
@@ -509,8 +511,8 @@ def test_metadata_sidecar_per_layer(tmp_path, fmt):
     assert sidecar in plan.output_paths
     summary = json.loads(run_export(plan).read_text())
 
-    # The source's JSON as read from its .h5, not the copy rewritten for the export.
-    assert json.loads(sidecar.read_text(encoding="utf-8")) == src.metadata
+    # The exported volume's metadata, as embedded in a .lux.h5 export.
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == export_metadata(src, 0)
     assert (tmp_path / "out" / "Red-561.metadata.json").exists()
     assert summary["layers"][0]["metadata_sidecars"] == ["Green-488.metadata.json"]
     extra = sidecar.with_suffix(f".{fmt}")
@@ -552,6 +554,6 @@ def test_mosaic_writes_one_sidecar_per_tile(tmp_path, fmt):
         "561_mosaic_3_tiles_raw_stack_1-x00-y01.metadata.json",
     ]
     for name, (_tile, md) in zip(names, tiles):
-        assert json.loads((tmp_path / name).read_text(encoding="utf-8")) == md
+        assert json.loads((tmp_path / name).read_text(encoding="utf-8")) == to_spec(md)
         assert ((tmp_path / name).with_suffix(".csv").exists()) == (fmt == "csv")
     assert not (tmp_path / "561_mosaic_3_tiles.metadata.json").exists()

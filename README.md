@@ -242,15 +242,40 @@ Options:
   `napari_luxendo._export.convert_json_metadata(path, "csv")` converts any
   JSON file the same way.
 - **Luxendo metadata sidecar**: every layer also gets `<layer>.metadata.json`
-  next to its outputs, in every format. It is the JSON `metadata` dataset of
-  the layer's source `.lux.h5`, unchanged (for a time series, the first
-  timepoint). A stitched mosaic gets one `<layer>_<tile>.metadata.json` per
-  tile instead, each with that tile's own JSON. The TXT / CSV choice above adds
-  a `.txt` / `.csv` copy of every sidecar.
+  next to its outputs, in every format: the metadata of the exported volume,
+  the same JSON a `.lux.h5` export embeds (for a time series, the first
+  exported timepoint). A stitched mosaic gets one
+  `<layer>_<tile>.metadata.json` per tile instead, each with that tile's own
+  metadata. The TXT / CSV choice above adds a `.txt` / `.csv` copy of every
+  sidecar.
 
-An exported `.lux.h5` holds `Data`, the pyramid levels and the source's JSON
-metadata with `image_size_vx`, `time_point` and `affine_to_sample` rewritten
-for the exported grid, so it opens in the same place in sample space. The
+All exported metadata follows the
+[Luxendo Image spec](https://github.com/Luxendo/luxendo-image) layout:
+
+- `processingInformation` first, with its fields and the `acquisition` entries'
+  fields in the spec's order. Blocks outside the spec that some files carry
+  (`metaData`, `cameraData`, `imagingBranch`) follow unchanged; empty ones are
+  dropped.
+- Values come from the source metadata. `image_size_vx`, `voxel_size_um` and
+  `time_point` describe the exported grid, and `napari-luxendo` is added to
+  `sources`.
+- `affine_to_sample` keeps the source's transform chain, with a `"crop"`
+  translation applied first when you export an ROI. Where the layer isn't
+  placed by that chain (a stitched mosaic), it is the layer's placement, split
+  into the voxel-size scaling the spec asks for first and the rest.
+- A stitched mosaic's `acquisition` lists every tile's entries, as the spec
+  does for fused images; its `stack` is left out, since no single tile's
+  applies.
+- Filled in only where the spec defines the value: `repetition` (0 when
+  missing), `pm` (from the `stack_scan_id`, left out for `pm:none`) and
+  `stack_scan_ids`. Time stamps are written in UTC (`...Z`). Optional fields the
+  source lacks, such as `channel_description` or a transform's `type`, are not
+  invented.
+- Required fields still missing are listed per sidecar under
+  `metadata_missing_fields` in `luxendo_export.json`.
+
+An exported `.lux.h5` holds `Data`, the pyramid levels and that JSON metadata,
+so it opens in the same place in sample space. The
 RAM slider sets the share of available memory a Z-slab may use. The output
 directory must not hold the source files.
 

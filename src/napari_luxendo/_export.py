@@ -19,9 +19,11 @@ For ``.lux.h5`` an Imaris ``.ims`` header linking every exported channel and
 timepoint can be written alongside.
 
 Every layer whose source view carries Luxendo JSON ``metadata`` also gets a
-``<layer>.metadata.json`` sidecar next to its outputs: that JSON exactly as it
-is stored in the source ``.h5``, optionally with a TXT or CSV copy. A stitched
-mosaic gets one ``<layer>_<tile>.metadata.json`` per tile instead.
+``<layer>.metadata.json`` sidecar next to its outputs, optionally with a TXT or
+CSV copy: the metadata of the exported volume, as embedded in ``.lux.h5``
+exports. A stitched mosaic gets one ``<layer>_<tile>.metadata.json`` per tile
+instead, with that tile's own metadata. All exported metadata follows the
+Luxendo Image spec layout (:mod:`._spec`).
 
 This module does not import napari or Qt.
 """
@@ -41,6 +43,7 @@ from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 
+from ._spec import missing_fields, to_spec
 from ._pyramids import (
     StreamingPyramidWriter,
     compute_pyramid_level_shape,
@@ -297,7 +300,7 @@ def plan_export(
         while stem.casefold() in used_stems:
             stem, n = f"{base}_{n}", n + 1
         used_stems.add(stem.casefold())
-        sidecars += _sidecars(src, output_dir, stem)
+        first_job = len(jobs)
 
         itemsize = 1 if fmt == FORMAT_JPEG else np.dtype(src.data.dtype).itemsize
         for frame, t in enumerate(src.timepoints):
@@ -311,13 +314,13 @@ def plan_export(
                 levels=levels,
                 output_bytes=_output_bytes(out_shape, itemsize, levels),
             ))
+        if len(jobs) > first_job:
+            sidecars += _sidecars(src, output_dir, stem, jobs[first_job].timepoint)
     if not jobs:
         raise ValueError("No timepoint of the selected layers is in the chosen range.")
 
-    exported = {id(job.source) for job in jobs}
     plan = ExportPlan(fmt=fmt, output_dir=output_dir, write_pyramids=pyramids, jobs=jobs,
-                      metadata_format=metadata_format,
-                      sidecars=[sc for sc in sidecars if id(sc[0]) in exported])
+                      metadata_format=metadata_format, sidecars=sidecars)
     if fmt == FORMAT_LUX_H5 and write_header:
         plan.header_note = _ims_header_problem(plan)
         if not plan.header_note:
@@ -330,10 +333,12 @@ def plan_export(
 # --------------------------------------------------------------------------- #
 
 
-def _sidecars(src: ExportSource, output_dir: Path, stem: str) -> list:
+def _sidecars(src: ExportSource, output_dir: Path, stem: str, timepoint: int) -> list:
     """``(source, metadata, path)`` of the JSON sidecars to write for *src*.
 
-    One per tile of a mosaic, named after the tile, else one for the layer.
+    One per tile of a mosaic, named after the tile, holding that tile's own
+    metadata; else one for the layer, holding the metadata of its exported
+    volume at *timepoint* (its first exported one). Both follow the spec.
     """
     tiles = [(name, md) for name, md in src.tile_metadata if isinstance(md, dict) and md]
     if len(src.tile_metadata) > 1 and tiles:
@@ -344,10 +349,10 @@ def _sidecars(src: ExportSource, output_dir: Path, stem: str) -> list:
             while tile.casefold() in used:
                 tile, n = f"{base}_{n}", n + 1
             used.add(tile.casefold())
-            out.append((src, md, output_dir / f"{stem}_{tile}{SIDECAR_SUFFIX}"))
+            out.append((src, to_spec(md), output_dir / f"{stem}_{tile}{SIDECAR_SUFFIX}"))
         return out
     if isinstance(src.metadata, dict) and src.metadata:
-        return [(src, src.metadata, output_dir / f"{stem}{SIDECAR_SUFFIX}")]
+        return [(src, export_metadata(src, timepoint), output_dir / f"{stem}{SIDECAR_SUFFIX}")]
     return []
 
 
@@ -365,7 +370,19 @@ def affine_to_luxendo(affine_zyx: np.ndarray) -> dict[str, list]:
 
 
 def export_metadata(source: ExportSource, timepoint: int) -> dict[str, Any]:
-    """The source's Luxendo metadata, rewritten for the exported volume."""
+    """The source's Luxendo metadata, rewritten for the exported volume.
+
+    The result follows the Luxendo Image spec (see :mod:`._spec`).
+    ``image_size_vx``, ``voxel_size_um`` and ``time_point`` describe the
+    exported grid. ``affine_to_sample`` keeps the source's transform chain when
+    the layer sits where that chain puts it, with a crop offset applied first
+    for an ROI; otherwise it is the layer's placement split into the voxel-size
+    scaling the spec asks for first, and the rest. A stitched mosaic lists every
+    tile's ``acquisition`` entries, as the spec does for fused images.
+    """
+    from . import __version__
+    from ._lux import compose_affine_to_sample
+
     meta = copy.deepcopy(source.metadata) if isinstance(source.metadata, dict) else {}
     proc = meta.get("processingInformation")
     if not isinstance(proc, dict):
@@ -377,18 +394,66 @@ def export_metadata(source: ExportSource, timepoint: int) -> dict[str, Any]:
     if source.voxel_size_um:
         z, y, x = source.voxel_size_um
         proc["voxel_size_um"] = {"width": x, "height": y, "depth": z}
-    if source.affine_zyx is not None:
+    software = f"napari-luxendo {__version__}"
+    sources = proc.get("sources") if isinstance(proc.get("sources"), list) else []
+    proc["sources"] = sources + ([software] if software not in sources else [])
+
+    chain = proc.get("affine_to_sample")
+    chain = [chain] if isinstance(chain, dict) else chain
+    composed = compose_affine_to_sample(chain)
+    if source.affine_zyx is None:
+        proc.pop("affine_to_sample", None)
+    elif (source.fused_views == 1 and composed is not None
+          and np.allclose(composed, source.affine_zyx)):
+        if source.roi is not None:
+            crop = {"matrix": np.eye(3).tolist(),
+                    "translation": [float(source.roi[4]), float(source.roi[2]), float(source.roi[0])],
+                    "type": "crop"}
+            chain = [crop, *chain]
+        proc["affine_to_sample"] = chain
+    else:
         affine = np.array(source.affine_zyx, dtype=float)
         if source.roi is not None:
             origin = np.array([source.roi[0], source.roi[2], source.roi[4]], dtype=float)
             affine[:3, 3] += affine[:3, :3] @ origin
-        proc["affine_to_sample"] = [affine_to_luxendo(affine)]
-    else:
-        proc.pop("affine_to_sample", None)
+        proc["affine_to_sample"] = _split_voxel_scaling(affine, source.voxel_size_um)
+
     if source.fused_views > 1:
         # The reference tile's stack id no longer describes a fused mosaic.
         proc.pop("stack", None)
-    return meta
+        tiles = [md.get("processingInformation") for _n, md in source.tile_metadata
+                 if isinstance(md, dict)]
+        tiles = [t for t in tiles if isinstance(t, dict)]
+        if tiles:
+            acq = [a for t in tiles for a in (t.get("acquisition") or [])]
+            if acq:
+                proc["acquisition"] = acq
+            ids = [i for t in tiles for i in (t.get("stack_scan_ids") or [])]
+            if ids:
+                proc["stack_scan_ids"] = list(dict.fromkeys(ids))
+            dirs = [d for t in tiles for d in (t.get("detection_directions") or [])]
+            if dirs:
+                proc["detection_directions"] = [list(d) for d in dict.fromkeys(tuple(d) for d in dirs)]
+            proc["contains_beads"] = any(bool(t.get("contains_beads")) for t in tiles)
+    return to_spec(meta)
+
+
+def _split_voxel_scaling(affine_zyx: np.ndarray, voxel_zyx: Optional[tuple]) -> list[dict]:
+    """``affine_to_sample`` for a napari affine: voxel-size scaling first, then the rest.
+
+    The spec asks writers to start the chain with a diagonal matrix of
+    ``voxel_size_um``, so viewers that only read the voxel size agree with
+    those that apply the whole chain.
+    """
+    whole = affine_to_luxendo(affine_zyx)
+    if not voxel_zyx or not all(v > 0 for v in voxel_zyx):
+        return [whole]
+    scale = np.diag([float(v) for v in voxel_zyx[::-1]])  # x, y, z
+    rest = np.asarray(whole["matrix"], dtype=float) @ np.linalg.inv(scale)
+    return [
+        {"matrix": scale.tolist(), "translation": [0.0, 0.0, 0.0], "type": "voxel-size"},
+        {"matrix": rest.tolist(), "translation": whole["translation"]},
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -668,6 +733,9 @@ def _write_summary(plan: ExportPlan) -> Path:
             "shape_zyx": list(src.output_shape),
             "pyramid_levels": [lvl[0] for lvl in job.levels],
             "metadata_sidecars": [p.name for s, _m, p in plan.sidecars if s is src],
+            # Required Luxendo-spec fields the source metadata doesn't provide.
+            "metadata_missing_fields": {p.name: gaps for s, m, p in plan.sidecars
+                                        if s is src and (gaps := missing_fields(m))},
             "outputs": [],
         })
         if plan.fmt == FORMAT_JPEG:
@@ -722,11 +790,10 @@ def flatten_json(value: Any, prefix: str = "") -> list[tuple[str, str]]:
 
 def write_metadata_sidecar(metadata: dict[str, Any], path: Path | str,
                            fmt: str = METADATA_JSON) -> Path:
-    """Write a source's Luxendo *metadata* as the JSON sidecar *path*.
+    """Write Luxendo *metadata* (already in the spec layout) as the JSON sidecar *path*.
 
-    The JSON is the source view's ``metadata`` dataset as read from its
-    ``.h5``, unchanged. With *fmt* ``txt`` or ``csv`` a flattened copy is
-    written next to it (see :func:`convert_json_metadata`).
+    With *fmt* ``txt`` or ``csv`` a flattened copy is written next to it (see
+    :func:`convert_json_metadata`).
     """
     path = Path(path)
     path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")

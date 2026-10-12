@@ -132,13 +132,15 @@ def test_export_crop_is_applied_first():
 
 def test_export_mosaic_lists_every_tile_and_starts_with_voxel_size():
     other = json.loads(json.dumps(RAW_TILE))
+    other["processingInformation"]["stack"] = "2-x01-y00"
     other["processingInformation"]["acquisition"][0]["stack"] = "2-x01-y00"
     other["processingInformation"]["stack_scan_ids"] = ["oc:default_st:2-x01-y00_ch:3_tp:0_pm:none"]
     src = _tile_source(fused=2, tiles=[("a", RAW_TILE), ("b", other)])
     proc = export_metadata(src, 0)["processingInformation"]
     assert [a["stack"] for a in proc["acquisition"]] == ["2-x00-y00", "2-x01-y00"]
-    assert len(proc["stack_scan_ids"]) == 2 and "stack" not in proc
+    assert len(proc["stack_scan_ids"]) == 2 and proc["stack"] == "Fused-2-x00-y00-2-x01-y00"
+    assert proc["camera"] == "long"  # shared by every tile
     chain = proc["affine_to_sample"]
     np.testing.assert_allclose(chain[0]["matrix"], np.diag([1.4625, 1.4625, 5.0]))
     np.testing.assert_allclose(compose_affine_to_sample(chain), src.affine_zyx, atol=1e-9)
-    assert "processingInformation.stack" in missing_fields(export_metadata(src, 0))
+    assert missing_fields(export_metadata(src, 0)) == []

@@ -99,6 +99,8 @@ def _acquisition(entry: Any) -> Any:
     if not isinstance(entry, dict):
         return entry
     e = dict(entry)
+    if isinstance(e.get("time_point"), int) and not isinstance(e["time_point"], bool):
+        e["time_point"] = str(e["time_point"])  # the spec names timepoints with strings
     if "pm" not in e:
         pm = _pm_from_scan_id(e.get("stack_scan_id"))
         if pm is not None:
@@ -132,6 +134,8 @@ def _acquisition(entry: Any) -> Any:
 def processing_information(proc: dict[str, Any]) -> dict[str, Any]:
     """*proc* (a ``processingInformation`` block) in the spec's layout."""
     p = copy.deepcopy(proc)
+    if isinstance(p.get("time_point"), int) and not isinstance(p["time_point"], bool):
+        p["time_point"] = str(p["time_point"])  # the spec names timepoints with strings
     p.setdefault("version", SPEC_VERSION)
     acq = p.get("acquisition")
     if isinstance(acq, dict):

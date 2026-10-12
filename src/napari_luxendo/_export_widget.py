@@ -296,9 +296,10 @@ class ExportWidget(QWidget):
         self.combo_metadata.addItem("JSON + TXT", METADATA_TXT)
         self.combo_metadata.addItem("JSON + CSV", METADATA_CSV)
         self.combo_metadata.setToolTip(
-            "luxendo_export.json and, for each layer, <layer>.metadata.json (the "
-            "Luxendo metadata stored in the source .h5) are always written. TXT and "
-            "CSV add a copy of each with one key and value per line."
+            "Each exported volume gets <layer>_tp-<id>.json with the Luxendo metadata "
+            "of its source file(s); a stitched mosaic adds one per tile. "
+            "luxendo_export.json summarises the export. TXT and CSV add a copy of "
+            "each with one key and value per line."
         )
         row_meta.addWidget(self.combo_metadata, 1)
         lay.addLayout(row_meta)

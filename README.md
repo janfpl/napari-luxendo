@@ -233,7 +233,8 @@ Options:
   `numba` for a multi-threaded reduction.
 - **Imaris header** (`.lux.h5` only): `luxendo_export.ims` links every exported
   layer (as a channel) and timepoint. It needs all layers to export at the same
-  size.
+  size and timepoints. Its timepoint times are the earliest acquisition time
+  stamp of each exported frame (UTC).
 - **Metadata summary**: `luxendo_export.json` (layers, source files, ROI,
   outputs, pyramid levels, export date) is always written. *JSON + TXT* or
   *JSON + CSV* adds `luxendo_export.txt` / `.csv`, the same content with one
@@ -241,13 +242,18 @@ Options:
   `key: value` (TXT) or as `key,value` rows under a header (CSV). From Python,
   `napari_luxendo._export.convert_json_metadata(path, "csv")` converts any
   JSON file the same way.
-- **Luxendo metadata sidecar**: every layer also gets `<layer>.metadata.json`
-  next to its outputs, in every format: the metadata of the exported volume,
-  the same JSON a `.lux.h5` export embeds (for a time series, the first
-  exported timepoint). A stitched mosaic gets one
-  `<layer>_<tile>.metadata.json` per tile instead, each with that tile's own
-  metadata. The TXT / CSV choice above adds a `.txt` / `.csv` copy of every
-  sidecar.
+- **Luxendo metadata sidecar**: every exported volume gets
+  `<layer>_tp-<id>.json` next to it, in every format (Luxendo writes
+  `<name>.json` next to `<name>.lux.h5` the same way). It holds the same JSON a
+  `.lux.h5` export embeds, built from the metadata of that timepoint's own
+  source file(s), so a later frame never reuses the first frame's acquisition
+  records. A stitched mosaic also gets `<layer>_tp-<id>_<tile>.json` per tile,
+  each with that tile's own metadata. The TXT / CSV choice above adds a `.txt`
+  / `.csv` copy of every sidecar. Sidecars are published together with their
+  volume, so cancelling a later volume keeps the finished ones complete. Frames
+  napari shows as zeros because no file holds them are not exported. Reopen a
+  time-series layer opened with an older version of the plugin before
+  exporting it.
 
 All exported metadata follows the
 [Luxendo Image spec](https://github.com/Luxendo/luxendo-image) layout:
@@ -263,18 +269,21 @@ All exported metadata follows the
   translation applied first when you export an ROI. Where the layer isn't
   placed by that chain (a stitched mosaic), it is the layer's placement, split
   into the voxel-size scaling the spec asks for first and the rest.
-- A stitched mosaic's `acquisition` lists every tile's entries, as the spec
-  does for fused images; its `stack` is left out, since no single tile's
-  applies.
+- A stitched mosaic's `acquisition` lists the entries of that timepoint's
+  tiles, as the spec does for fused images. `stack`, `objective` and `camera`
+  keep a name all tiles share, or join distinct ones as `Fused-...` (the spec's
+  own example is `"Fused-left-right"`); each tile's identity stays in its
+  acquisition entry.
 - Filled in only where the spec defines the value: `repetition` (0 when
   missing), `pm` (from the `stack_scan_id`, left out for `pm:none`) and
   `stack_scan_ids`. Time stamps are written in UTC (`...Z`). Optional fields the
   source lacks, such as `channel_description` or a transform's `type`, are not
-  invented.
+  invented. Timepoint names are strings, keeping any leading zeros (`"00003"`).
 - Required fields still missing are listed per sidecar under
   `metadata_missing_fields` in `luxendo_export.json`.
 
-An exported `.lux.h5` holds `Data`, the pyramid levels and that JSON metadata,
+An exported `.lux.h5` holds `Data` (uint16, as the spec requires; export other
+data types as TIFF), the pyramid levels and that JSON metadata,
 so it opens in the same place in sample space. The
 RAM slider sets the share of available memory a Z-slab may use. The output
 directory must not hold the source files.

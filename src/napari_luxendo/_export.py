@@ -18,12 +18,12 @@ optionally cropped to a voxel ROI, and written as either
 For ``.lux.h5`` an Imaris ``.ims`` header linking every exported channel and
 timepoint can be written alongside.
 
-Every layer whose source view carries Luxendo JSON ``metadata`` also gets a
-``<layer>.metadata.json`` sidecar next to its outputs, optionally with a TXT or
-CSV copy: the metadata of the exported volume, as embedded in ``.lux.h5``
-exports. A stitched mosaic gets one ``<layer>_<tile>.metadata.json`` per tile
-instead, with that tile's own metadata. All exported metadata follows the
-Luxendo Image spec layout (:mod:`._spec`).
+Every exported volume gets a ``<layer>_tp-<id>.json`` sidecar next to it,
+optionally with a TXT or CSV copy: the same metadata a ``.lux.h5`` export
+embeds, built from the JSON of that timepoint's source view(s). A stitched
+mosaic also gets ``<layer>_tp-<id>_<tile>.json`` per tile, with that tile's own
+metadata. All exported metadata follows the Luxendo Image spec layout
+(:mod:`._spec`).
 
 This module does not import napari or Qt.
 """
@@ -37,7 +37,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
@@ -66,7 +66,7 @@ _EXTENSIONS = {
 }
 
 SUMMARY_FILENAME = "luxendo_export.json"
-SIDECAR_SUFFIX = ".metadata.json"
+SIDECAR_SUFFIX = ".json"  # next to <name>.lux.h5, as Luxendo writes <name>.json
 
 # Extra copies of the JSON summary and metadata sidecars, flattened to one ``key, value`` per line.
 METADATA_JSON = "json"  # the JSON summary only
@@ -136,6 +136,9 @@ class ExportSource:
     contrast_limits: Optional[tuple[float, float]] = None  # 8-bit scaling for JPEG
     fused_views: int = 1  # number of tiles stitched into the data
     source_files: list[str] = field(default_factory=list)
+    # The reader's per-timepoint views: {t: [{"view", "file", "luxendo"}]}. None for
+    # sources built without it; an empty list marks a frame with no source file.
+    metadata_by_timepoint: Optional[dict[int, list[dict[str, Any]]]] = None
 
     @property
     def shape_zyx(self) -> tuple[int, int, int]:
@@ -159,10 +162,18 @@ class ExportJob:
     output: Path
     levels: list[tuple[str, int, int, int]]  # (name, factor_w, factor_h, factor_d)
     output_bytes: int
+    metadata: Optional[dict[str, Any]] = None  # embedded in .lux.h5, built once when planning
+    # (metadata, path) of the JSON sidecars published together with this output.
+    sidecars: list[tuple[dict[str, Any], Path]] = field(default_factory=list)
 
     @property
     def output_shape(self) -> tuple[int, int, int]:
         return self.source.output_shape
+
+    @property
+    def sidecar(self) -> Optional[Path]:
+        """The output's own JSON sidecar (per-tile ones follow it in :attr:`sidecars`)."""
+        return self.sidecars[0][1] if self.sidecars else None
 
 
 @dataclass
@@ -249,7 +260,8 @@ def plan_export(
     ------
     ValueError
         For an unknown format, an ROI outside a volume, no timepoint in range,
-        non-uint16 data with pyramids, or an output directory holding a source.
+        duplicate timepoint ids, non-uint16 data for ``.lux.h5``, or an output
+        directory holding a source.
     """
     if fmt not in FORMATS:
         raise ValueError(f"Unknown export format: {fmt!r}")
@@ -277,14 +289,17 @@ def plan_export(
     for src in sources:
         if src.data.ndim != 4 or len(src.timepoints) != src.data.shape[0]:
             raise ValueError(f"{src.name}: expected (T, Z, Y, X) data with one id per timepoint")
+        if len(set(src.timepoints)) != len(src.timepoints):
+            raise ValueError(f"{src.name}: duplicate timepoint ids would overwrite an output")
         if src.roi is not None:
             validate_roi(src.roi, src.shape_zyx)
         out_shape = src.output_shape
         levels = _job_levels(src, out_shape) if pyramids else []
-        if levels and np.dtype(src.data.dtype) != np.uint16:
+        # The Luxendo Image spec stores Data as uint16.
+        if fmt == FORMAT_LUX_H5 and np.dtype(src.data.dtype) != np.uint16:
             raise ValueError(
-                f"{src.name}: pyramid regeneration supports uint16 data only, not "
-                f"{src.data.dtype}. Disable pyramid layers to export it."
+                f"{src.name}: Luxendo Image (.lux.h5) requires uint16 data, not "
+                f"{src.data.dtype}. Export it as TIFF to keep its data type."
             )
 
         if fmt == FORMAT_JPEG and max(out_shape[1:]) > _JPEG_MAX_EDGE:
@@ -300,22 +315,28 @@ def plan_export(
         while stem.casefold() in used_stems:
             stem, n = f"{base}_{n}", n + 1
         used_stems.add(stem.casefold())
-        first_job = len(jobs)
 
         itemsize = 1 if fmt == FORMAT_JPEG else np.dtype(src.data.dtype).itemsize
         for frame, t in enumerate(src.timepoints):
             if timepoint_range is not None and not timepoint_range[0] <= t <= timepoint_range[1]:
                 continue
-            jobs.append(ExportJob(
+            if src.metadata_by_timepoint is not None and not src.metadata_by_timepoint.get(t):
+                # The reader shows a frame with no source file as zeros; there
+                # is no acquired image to export for it.
+                continue
+            metadata = export_metadata(src, t)
+            job = ExportJob(
                 source=src,
                 frame=frame,
                 timepoint=t,
                 output=output_dir / f"{stem}_tp-{t}{ext}",
                 levels=levels,
                 output_bytes=_output_bytes(out_shape, itemsize, levels),
-            ))
-        if len(jobs) > first_job:
-            sidecars += _sidecars(src, output_dir, stem, jobs[first_job].timepoint)
+                metadata=metadata,
+                sidecars=_sidecars(src, t, output_dir / f"{stem}_tp-{t}", metadata),
+            )
+            jobs.append(job)
+            sidecars += [(src, md, path) for md, path in job.sidecars]
     if not jobs:
         raise ValueError("No timepoint of the selected layers is in the chosen range.")
 
@@ -333,27 +354,56 @@ def plan_export(
 # --------------------------------------------------------------------------- #
 
 
-def _sidecars(src: ExportSource, output_dir: Path, stem: str, timepoint: int) -> list:
-    """``(source, metadata, path)`` of the JSON sidecars to write for *src*.
+def _sidecars(src: ExportSource, timepoint: int, base: Path,
+              metadata: dict[str, Any]) -> list[tuple[dict[str, Any], Path]]:
+    """``(metadata, path)`` of the JSON sidecars for one output, named after *base*.
 
-    One per tile of a mosaic, named after the tile, holding that tile's own
-    metadata; else one for the layer, holding the metadata of its exported
-    volume at *timepoint* (its first exported one). Both follow the spec.
+    ``<base>.json`` holds the output's own metadata (as embedded in a
+    ``.lux.h5``). A stitched mosaic adds ``<base>_<tile>.json`` per tile,
+    holding that tile's own metadata in the spec layout.
     """
-    tiles = [(name, md) for name, md in src.tile_metadata if isinstance(md, dict) and md]
-    if len(src.tile_metadata) > 1 and tiles:
-        out, used = [], set()
+    out = [(metadata, base.with_name(base.name + SIDECAR_SUFFIX))]
+    tiles = _tile_documents(src, timepoint)
+    if src.fused_views > 1 and len(tiles) > 1:
+        used: set[str] = set()
         for name, md in tiles:
-            tile = base = safe_filename(re.sub(r"(\.lux)?\.h5$", "", name, flags=re.IGNORECASE))
+            tile = stem = safe_filename(re.sub(r"(\.lux)?\.h5$", "", name, flags=re.IGNORECASE))
             n = 2
             while tile.casefold() in used:
-                tile, n = f"{base}_{n}", n + 1
+                tile, n = f"{stem}_{n}", n + 1
             used.add(tile.casefold())
-            out.append((src, to_spec(md), output_dir / f"{stem}_{tile}{SIDECAR_SUFFIX}"))
-        return out
-    if isinstance(src.metadata, dict) and src.metadata:
-        return [(src, export_metadata(src, timepoint), output_dir / f"{stem}{SIDECAR_SUFFIX}")]
-    return []
+            out.append((md, base.with_name(f"{base.name}_{tile}{SIDECAR_SUFFIX}")))
+    return out
+
+
+def _tile_documents(source: ExportSource, timepoint: int) -> list[tuple[str, dict[str, Any]]]:
+    """``(view name, spec metadata)`` of every source view of one exported frame."""
+    if source.metadata_by_timepoint is not None:
+        return [(e.get("view") or Path(e.get("file", "")).name or "view",
+                 to_spec(e.get("luxendo") or {}))
+                for e in source.metadata_by_timepoint.get(timepoint) or []]
+    if source.fused_views > 1 and source.tile_metadata:
+        return [(name, to_spec(md if isinstance(md, dict) else {}))
+                for name, md in source.tile_metadata]
+    return [(source.name, to_spec(source.metadata if isinstance(source.metadata, dict) else {}))]
+
+
+def _frame_metadata(source: ExportSource, timepoint: int) -> list[dict[str, Any]]:
+    """Spec metadata of the source views that make up one exported frame.
+
+    Without per-timepoint metadata, a time series whose reference view lists
+    acquisitions is refused: those would describe the first frame only.
+    """
+    if source.metadata_by_timepoint is not None and not source.metadata_by_timepoint.get(timepoint):
+        raise ValueError(f"{source.name}: no source file for timepoint {timepoint}")
+    documents = [md for _name, md in _tile_documents(source, timepoint)]
+    if (source.metadata_by_timepoint is None and len(source.timepoints) > 1
+            and any(d["processingInformation"].get("acquisition") for d in documents)):
+        raise ValueError(
+            f"{source.name}: supply metadata_by_timepoint for a time series; the "
+            "first frame's acquisition metadata cannot describe every timepoint."
+        )
+    return documents
 
 
 def affine_to_luxendo(affine_zyx: np.ndarray) -> dict[str, list]:
@@ -383,14 +433,18 @@ def export_metadata(source: ExportSource, timepoint: int) -> dict[str, Any]:
     from . import __version__
     from ._lux import compose_affine_to_sample
 
-    meta = copy.deepcopy(source.metadata) if isinstance(source.metadata, dict) else {}
+    frame = _frame_metadata(source, timepoint)
+    meta = copy.deepcopy(frame[0])
     proc = meta.get("processingInformation")
     if not isinstance(proc, dict):
         proc = meta["processingInformation"] = {}
 
     nz, ny, nx = source.output_shape
     proc["image_size_vx"] = {"width": nx, "height": ny, "depth": nz}
-    proc["time_point"] = timepoint if isinstance(proc.get("time_point"), int) else str(timepoint)
+    # Timepoint names are strings and may keep leading zeros ("00003").
+    original = str(proc.get("time_point", ""))
+    proc["time_point"] = (original if original.isascii() and original.isdigit()
+                          and int(original) == timepoint else str(timepoint))
     if source.voxel_size_um:
         z, y, x = source.voxel_size_um
         proc["voxel_size_um"] = {"width": x, "height": y, "depth": z}
@@ -401,10 +455,11 @@ def export_metadata(source: ExportSource, timepoint: int) -> dict[str, Any]:
     chain = proc.get("affine_to_sample")
     chain = [chain] if isinstance(chain, dict) else chain
     composed = compose_affine_to_sample(chain)
-    if source.affine_zyx is None:
+    affine = source.affine_zyx if source.affine_zyx is not None else composed
+    if affine is None:
         proc.pop("affine_to_sample", None)
     elif (source.fused_views == 1 and composed is not None
-          and np.allclose(composed, source.affine_zyx)):
+          and np.allclose(composed, affine)):
         if source.roi is not None:
             crop = {"matrix": np.eye(3).tolist(),
                     "translation": [float(source.roi[4]), float(source.roi[2]), float(source.roi[0])],
@@ -412,18 +467,14 @@ def export_metadata(source: ExportSource, timepoint: int) -> dict[str, Any]:
             chain = [crop, *chain]
         proc["affine_to_sample"] = chain
     else:
-        affine = np.array(source.affine_zyx, dtype=float)
+        affine = np.array(affine, dtype=float)
         if source.roi is not None:
             origin = np.array([source.roi[0], source.roi[2], source.roi[4]], dtype=float)
             affine[:3, 3] += affine[:3, :3] @ origin
         proc["affine_to_sample"] = _split_voxel_scaling(affine, source.voxel_size_um)
 
     if source.fused_views > 1:
-        # The reference tile's stack id no longer describes a fused mosaic.
-        proc.pop("stack", None)
-        tiles = [md.get("processingInformation") for _n, md in source.tile_metadata
-                 if isinstance(md, dict)]
-        tiles = [t for t in tiles if isinstance(t, dict)]
+        tiles = [md["processingInformation"] for md in frame]
         if tiles:
             acq = [a for t in tiles for a in (t.get("acquisition") or [])]
             if acq:
@@ -435,6 +486,22 @@ def export_metadata(source: ExportSource, timepoint: int) -> dict[str, Any]:
             if dirs:
                 proc["detection_directions"] = [list(d) for d in dict.fromkeys(tuple(d) for d in dirs)]
             proc["contains_beads"] = any(bool(t.get("contains_beads")) for t in tiles)
+            # A fused image still has a stack, objective and camera; the spec
+            # labels mixed ones "Fused-..." (e.g. "Fused-left-right"). Each
+            # tile's own identity stays in its acquisition entries.
+            for key in ("stack", "objective", "camera"):
+                values = list(dict.fromkeys(str(t[key]) for t in tiles if key in t))
+                if values:
+                    proc[key] = values[0] if len(values) == 1 else "Fused-" + "-".join(values)
+            proc.pop("stack_description", None)
+            merged = list(dict.fromkeys(x for t in tiles for x in (t.get("sources") or [])))
+            proc["sources"] = merged + ([software] if software not in merged else [])
+            proc["repetition"] = max((t.get("repetition", 0) for t in tiles), default=0)
+            pms = {t.get("pm") for t in tiles}
+            if len(pms) != 1 or None in pms:
+                proc.pop("pm", None)
+            else:
+                proc["pm"] = pms.pop()
     return to_spec(meta)
 
 
@@ -639,7 +706,8 @@ def _write_lux_h5(job: ExportJob, chunk_z: int, progress: ProgressCallback,
                 done += pyramid.consume(slab, start)
             del slab  # release before the next (possibly multi-GiB) read
             progress(done, job.output_bytes)
-        out.create_dataset("metadata", data=json.dumps(export_metadata(job.source, job.timepoint)))
+        metadata = job.metadata if job.metadata is not None else export_metadata(job.source, job.timepoint)
+        out.create_dataset("metadata", data=json.dumps(metadata))
         if pyramid is not None:
             summary = pyramid.finish()
             logger.info(
@@ -695,9 +763,22 @@ def run_export(
         # Write next to the destination and swap it in only once complete, so a
         # cancelled or failed overwrite keeps the previous export.
         staged = replace(job, output=job.output.with_name(f".{uuid.uuid4().hex}.{job.output.name}"))
+        # Its sidecars are staged too and published right after it, so a
+        # finished output never lacks them and a failed one never gets them.
+        staged_sidecars = [
+            (md, path, path.with_name(f".{uuid.uuid4().hex}.{path.name}"))
+            for md, path in job.sidecars
+        ]
+        suffixes = [SIDECAR_SUFFIX] + ([f".{plan.metadata_format}"]
+                                       if plan.metadata_format != METADATA_JSON else [])
         try:
             writer(staged, _chunk_z(job, ram_percent), _progress, cancel_check)
+            for md, _path, tmp in staged_sidecars:
+                write_metadata_sidecar(md, tmp, plan.metadata_format)
             _publish(staged.output, job.output)
+            for _md, path, tmp in staged_sidecars:
+                for suffix in suffixes:
+                    os.replace(tmp.with_suffix(suffix), path.with_suffix(suffix))
         except _Cancelled:
             _remove_output(staged)  # the writer has closed it by now
             logger.info("Export cancelled during %s", job.output.name)
@@ -705,14 +786,16 @@ def run_export(
         except BaseException:
             _remove_output(staged)  # never leave a truncated file behind
             raise
+        finally:
+            for _md, _path, tmp in staged_sidecars:
+                for suffix in suffixes:
+                    tmp.with_suffix(suffix).unlink(missing_ok=True)
         finished += job.output_bytes
         if progress_callback:
             progress_callback(finished, total)
 
     if plan.header is not None:
         write_ims_header(plan, plan.header)
-    for _src, metadata, path in plan.sidecars:
-        write_metadata_sidecar(metadata, path, plan.metadata_format)
     return _write_summary(plan)
 
 
@@ -740,7 +823,14 @@ def _write_summary(plan: ExportPlan) -> Path:
         })
         if plan.fmt == FORMAT_JPEG:
             entry["contrast_limits"] = list(jpeg_contrast_limits(src))
-        entry["outputs"].append({"timepoint": job.timepoint, "file": job.output.name})
+        entry["outputs"].append({
+            "timepoint": job.timepoint,
+            "file": job.output.name,
+            "metadata_sidecars": [path.name for _md, path in job.sidecars],
+            "source_files": ([e["file"] for e in src.metadata_by_timepoint.get(job.timepoint, [])
+                              if "file" in e] if src.metadata_by_timepoint is not None
+                             else src.source_files),
+        })
     summary = {
         "format": plan.fmt,
         "layers": list(layers.values()),
@@ -849,6 +939,21 @@ def _ims_header_problem(plan: ExportPlan) -> str:
     return ""
 
 
+def _acquisition_times(job: ExportJob) -> list[datetime]:
+    """The time-zone-aware acquisition time stamps in *job*'s metadata, in UTC."""
+    metadata = job.metadata if job.metadata is not None else export_metadata(job.source, job.timepoint)
+    times = []
+    for acq in metadata.get("processingInformation", {}).get("acquisition") or []:
+        for value in (acq.get("time_stamps") or []) if isinstance(acq, dict) else []:
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is not None:
+                times.append(parsed.astimezone(timezone.utc))
+    return times
+
+
 def _ims_text(value: Any) -> np.ndarray:
     """Imaris text attribute: an array of single characters."""
     return np.frombuffer(str(value).encode("ascii", "replace"), dtype="S1").copy()
@@ -915,10 +1020,13 @@ def write_ims_header(plan: ExportPlan, path: Path) -> Path:
         n_t = len(channels[0])
         info.attrs["DatasetTimePoints"] = _ims_text(n_t)
         info.attrs["FileTimePoints"] = _ims_text(n_t)
-        # Luxendo files carry no acquisition times; Imaris wants increasing ones.
+        # The earliest acquisition time stamp of each exported frame (UTC);
+        # frames without one fall back to increasing times from 2000-01-01.
         start = datetime(2000, 1, 1)
         for t in range(n_t):
-            stamp = (start + timedelta(seconds=t)).strftime("%Y-%m-%d %H:%M:%S.000")
+            times = [stamp for jobs in channels for stamp in _acquisition_times(jobs[t])]
+            first_time = min(times) if times else start + timedelta(seconds=t)
+            stamp = first_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             info.attrs[f"TimePoint{t + 1}"] = _ims_text(stamp)
     tmp.replace(path)
     return path

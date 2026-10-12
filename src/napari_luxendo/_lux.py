@@ -154,10 +154,22 @@ def parse_metadata(raw: Any) -> dict[str, Any]:
         if hasattr(raw, "shape") and hasattr(raw, "dtype") and not isinstance(raw, np.ndarray):
             raw = raw[()]  # h5py dataset
         if isinstance(raw, np.ndarray):
-            raw = raw.tobytes() if raw.dtype.kind in "SV" else raw.item()
+            if raw.dtype.kind in "SV" or (raw.dtype.kind in "ui" and raw.dtype.itemsize == 1):
+                raw = raw.tobytes()  # fixed-width string or a byte vector
+            elif raw.size == 1:
+                raw = raw.item()
+            elif raw.dtype.kind in "OU":  # an array of string pieces
+                raw = "".join(v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                              for v in raw.flat)
+            else:
+                raise ValueError("metadata is not a JSON string or byte array")
         if isinstance(raw, bytes):
-            raw = raw.decode("utf-8").rstrip("\x00")
+            raw = raw.decode("utf-8-sig")
+        if isinstance(raw, str):
+            raw = raw.rstrip("\x00")
         meta = json.loads(raw)
+        if not isinstance(meta, dict):
+            raise ValueError("Luxendo metadata must be a JSON object")
     except Exception as exc:
         logger.warning("Could not parse Luxendo metadata: %s", exc)
         return result

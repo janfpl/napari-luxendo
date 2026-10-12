@@ -108,6 +108,11 @@ def _contrast_limits(layer: Any) -> Optional[tuple[float, float]]:
 def export_source(layer: Any, roi: Optional[Roi] = None) -> ExportSource:
     """An :class:`ExportSource` for a Luxendo *layer*, cropped to *roi* (voxels)."""
     md = layer.metadata
+    if "metadata_by_timepoint" not in md and md.get("files") and len(layer_timepoints(layer)) > 1:
+        raise ValueError(
+            f"{layer.name}: reopen this layer before exporting, so each timepoint's "
+            "metadata is read from its own source file."
+        )
     placements = md.get("placements") or {}
     voxel = md.get("voxel_size_um")
     # Without affine_to_sample the layer is placed by voxel size (the camera
@@ -130,4 +135,5 @@ def export_source(layer: Any, roi: Optional[Roi] = None) -> ExportSource:
         contrast_limits=_contrast_limits(layer),
         fused_views=max(1, len(md.get("views") or [])),
         source_files=list(md.get("files") or []),
+        metadata_by_timepoint=md.get("metadata_by_timepoint"),
     )

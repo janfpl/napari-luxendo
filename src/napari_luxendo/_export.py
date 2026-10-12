@@ -18,6 +18,11 @@ optionally cropped to a voxel ROI, and written as either
 For ``.lux.h5`` an Imaris ``.ims`` header linking every exported channel and
 timepoint can be written alongside.
 
+Every layer whose source view carries Luxendo JSON ``metadata`` also gets a
+``<layer>.metadata.json`` sidecar next to its outputs: that JSON exactly as it
+is stored in the source ``.h5``, optionally with a TXT or CSV copy. A stitched
+mosaic gets one ``<layer>_<tile>.metadata.json`` per tile instead.
+
 This module does not import napari or Qt.
 """
 
@@ -58,8 +63,9 @@ _EXTENSIONS = {
 }
 
 SUMMARY_FILENAME = "luxendo_export.json"
+SIDECAR_SUFFIX = ".metadata.json"
 
-# Extra copies of the JSON summary, flattened to one ``key, value`` per line.
+# Extra copies of the JSON summary and metadata sidecars, flattened to one ``key, value`` per line.
 METADATA_JSON = "json"  # the JSON summary only
 METADATA_TXT = "txt"
 METADATA_CSV = "csv"
@@ -121,6 +127,8 @@ class ExportSource:
     affine_zyx: Optional[np.ndarray] = None  # 4x4 voxel -> sample transform
     voxel_size_um: Optional[tuple[float, float, float]] = None  # (z, y, x)
     metadata: dict[str, Any] = field(default_factory=dict)  # Luxendo JSON of the reference view
+    # (tile name, Luxendo JSON) of every tile stitched into a mosaic; empty for one view.
+    tile_metadata: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     color: Optional[tuple[float, float, float]] = None
     contrast_limits: Optional[tuple[float, float]] = None  # 8-bit scaling for JPEG
     fused_views: int = 1  # number of tiles stitched into the data
@@ -164,7 +172,9 @@ class ExportPlan:
     jobs: list[ExportJob]
     header: Optional[Path] = None  # .ims to write, if any
     header_note: str = ""  # why no header is written, when one was asked for
-    metadata_format: str = METADATA_JSON  # extra TXT / CSV copy of the summary
+    metadata_format: str = METADATA_JSON  # extra TXT / CSV copy of the summary and sidecars
+    # Source Luxendo metadata to write as JSON sidecars: (source, metadata, sidecar path).
+    sidecars: list[tuple[ExportSource, dict[str, Any], Path]] = field(default_factory=list)
 
     @property
     def total_bytes(self) -> int:
@@ -175,9 +185,10 @@ class ExportPlan:
         paths = [job.output for job in self.jobs]
         if self.header is not None:
             paths.append(self.header)
-        paths.append(self.output_dir / SUMMARY_FILENAME)
-        if self.metadata_format != METADATA_JSON:
-            paths.append(paths[-1].with_suffix(f".{self.metadata_format}"))
+        for json_path in [self.output_dir / SUMMARY_FILENAME, *(p for _s, _m, p in self.sidecars)]:
+            paths.append(json_path)
+            if self.metadata_format != METADATA_JSON:
+                paths.append(json_path.with_suffix(f".{self.metadata_format}"))
         return paths
 
 
@@ -258,6 +269,7 @@ def plan_export(
     pyramids = write_pyramids and fmt == FORMAT_LUX_H5
     ext = _EXTENSIONS[fmt]
     jobs: list[ExportJob] = []
+    sidecars: list[tuple[ExportSource, dict[str, Any], Path]] = []
     used_stems: set[str] = set()
     for src in sources:
         if src.data.ndim != 4 or len(src.timepoints) != src.data.shape[0]:
@@ -285,6 +297,7 @@ def plan_export(
         while stem.casefold() in used_stems:
             stem, n = f"{base}_{n}", n + 1
         used_stems.add(stem.casefold())
+        sidecars += _sidecars(src, output_dir, stem)
 
         itemsize = 1 if fmt == FORMAT_JPEG else np.dtype(src.data.dtype).itemsize
         for frame, t in enumerate(src.timepoints):
@@ -301,8 +314,10 @@ def plan_export(
     if not jobs:
         raise ValueError("No timepoint of the selected layers is in the chosen range.")
 
+    exported = {id(job.source) for job in jobs}
     plan = ExportPlan(fmt=fmt, output_dir=output_dir, write_pyramids=pyramids, jobs=jobs,
-                      metadata_format=metadata_format)
+                      metadata_format=metadata_format,
+                      sidecars=[sc for sc in sidecars if id(sc[0]) in exported])
     if fmt == FORMAT_LUX_H5 and write_header:
         plan.header_note = _ims_header_problem(plan)
         if not plan.header_note:
@@ -313,6 +328,27 @@ def plan_export(
 # --------------------------------------------------------------------------- #
 # Metadata
 # --------------------------------------------------------------------------- #
+
+
+def _sidecars(src: ExportSource, output_dir: Path, stem: str) -> list:
+    """``(source, metadata, path)`` of the JSON sidecars to write for *src*.
+
+    One per tile of a mosaic, named after the tile, else one for the layer.
+    """
+    tiles = [(name, md) for name, md in src.tile_metadata if isinstance(md, dict) and md]
+    if len(src.tile_metadata) > 1 and tiles:
+        out, used = [], set()
+        for name, md in tiles:
+            tile = base = safe_filename(re.sub(r"(\.lux)?\.h5$", "", name, flags=re.IGNORECASE))
+            n = 2
+            while tile.casefold() in used:
+                tile, n = f"{base}_{n}", n + 1
+            used.add(tile.casefold())
+            out.append((src, md, output_dir / f"{stem}_{tile}{SIDECAR_SUFFIX}"))
+        return out
+    if isinstance(src.metadata, dict) and src.metadata:
+        return [(src, src.metadata, output_dir / f"{stem}{SIDECAR_SUFFIX}")]
+    return []
 
 
 def affine_to_luxendo(affine_zyx: np.ndarray) -> dict[str, list]:
@@ -610,6 +646,8 @@ def run_export(
 
     if plan.header is not None:
         write_ims_header(plan, plan.header)
+    for _src, metadata, path in plan.sidecars:
+        write_metadata_sidecar(metadata, path, plan.metadata_format)
     return _write_summary(plan)
 
 
@@ -629,6 +667,7 @@ def _write_summary(plan: ExportPlan) -> Path:
             )),
             "shape_zyx": list(src.output_shape),
             "pyramid_levels": [lvl[0] for lvl in job.levels],
+            "metadata_sidecars": [p.name for s, _m, p in plan.sidecars if s is src],
             "outputs": [],
         })
         if plan.fmt == FORMAT_JPEG:
@@ -679,6 +718,21 @@ def flatten_json(value: Any, prefix: str = "") -> list[tuple[str, str]]:
     for key, child in items:
         rows += flatten_json(child, f"{prefix}.{key}" if prefix else str(key))
     return rows
+
+
+def write_metadata_sidecar(metadata: dict[str, Any], path: Path | str,
+                           fmt: str = METADATA_JSON) -> Path:
+    """Write a source's Luxendo *metadata* as the JSON sidecar *path*.
+
+    The JSON is the source view's ``metadata`` dataset as read from its
+    ``.h5``, unchanged. With *fmt* ``txt`` or ``csv`` a flattened copy is
+    written next to it (see :func:`convert_json_metadata`).
+    """
+    path = Path(path)
+    path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    if fmt != METADATA_JSON:
+        convert_json_metadata(path, fmt)
+    return path
 
 
 def convert_json_metadata(path: Path | str, fmt: str) -> Path:

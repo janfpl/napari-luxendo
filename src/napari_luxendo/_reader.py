@@ -459,6 +459,13 @@ def _build_layers(
                 "path": str(ref.path),
                 "files": sorted({str(v.path) for s in members for v in s.by_time.values()}),
                 "views": [s.reference.view_name or s.reference.path.name for s in members],
+                # Each stitched tile's own Luxendo JSON, for per-tile metadata export.
+                "tile_metadata": [
+                    {"view": s.reference.view_name or s.reference.path.name,
+                     "file": str(s.reference.path),
+                     "luxendo": s.reference.metadata.get("raw", {})}
+                    for s in members
+                ] if len(members) > 1 else [],
                 "timepoints": timepoints,
                 "pyramid_levels": ref.level_names[:native_count],
                 "voxel_size_um": ref.voxel_size_um,

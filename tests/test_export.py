@@ -497,4 +497,61 @@ def test_failed_overwrite_keeps_previous_export(tmp_path, monkeypatch):
         run_export(plan)
     assert plan.jobs[0].output.read_bytes() == before
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
-        [plan.jobs[0].output.name, SUMMARY_FILENAME])
+        [plan.jobs[0].output.name, SUMMARY_FILENAME, "Green-488.metadata.json"])
+
+
+@pytest.mark.parametrize("fmt", ["json", "txt", "csv"])
+def test_metadata_sidecar_per_layer(tmp_path, fmt):
+    src = _source()
+    plan = plan_export([src, _source(name="Red-561", seed=1)], tmp_path / "out",
+                       FORMAT_OME_TIFF, metadata_format=fmt)
+    sidecar = tmp_path / "out" / "Green-488.metadata.json"
+    assert sidecar in plan.output_paths
+    summary = json.loads(run_export(plan).read_text())
+
+    # The source's JSON as read from its .h5, not the copy rewritten for the export.
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == src.metadata
+    assert (tmp_path / "out" / "Red-561.metadata.json").exists()
+    assert summary["layers"][0]["metadata_sidecars"] == ["Green-488.metadata.json"]
+    extra = sidecar.with_suffix(f".{fmt}")
+    if fmt == "json":
+        assert not list((tmp_path / "out").glob("*.metadata.txt"))
+        assert not list((tmp_path / "out").glob("*.metadata.csv"))
+    else:
+        assert extra in plan.output_paths
+        assert "processingInformation.channel" in extra.read_text(encoding="utf-8")
+
+
+def test_no_sidecar_without_source_metadata(tmp_path):
+    src = _source()
+    src.metadata = {}
+    plan = plan_export([src], tmp_path, FORMAT_TIFF)
+    assert plan.sidecars == []
+    run_export(plan)
+    assert not list(tmp_path.glob("*.metadata.json"))
+    assert json.loads((tmp_path / "luxendo_export.json").read_text())["layers"][0][
+        "metadata_sidecars"] == []
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+def test_mosaic_writes_one_sidecar_per_tile(tmp_path, fmt):
+    src = _source(name="561 mosaic (3 tiles)")
+    tiles = [
+        ("uni_tp-0_ch-0_st-1-x00-y00_obj-left.lux.h5", {"processingInformation": {"stack": "1-x00-y00"}}),
+        ("uni_tp-0_ch-0_st-1-x01-y00_obj-left.lux.h5", {"processingInformation": {"stack": "1-x01-y00"}}),
+        ("raw_stack_1-x00-y01", {"processingInformation": {"stack": "1-x00-y01"}}),
+    ]
+    src.tile_metadata = tiles
+    plan = plan_export([src], tmp_path, FORMAT_TIFF, metadata_format=fmt)
+    summary = json.loads(run_export(plan).read_text())
+
+    names = summary["layers"][0]["metadata_sidecars"]
+    assert names == [
+        "561_mosaic_3_tiles_uni_tp-0_ch-0_st-1-x00-y00_obj-left.metadata.json",
+        "561_mosaic_3_tiles_uni_tp-0_ch-0_st-1-x01-y00_obj-left.metadata.json",
+        "561_mosaic_3_tiles_raw_stack_1-x00-y01.metadata.json",
+    ]
+    for name, (_tile, md) in zip(names, tiles):
+        assert json.loads((tmp_path / name).read_text(encoding="utf-8")) == md
+        assert ((tmp_path / name).with_suffix(".csv").exists()) == (fmt == "csv")
+    assert not (tmp_path / "561_mosaic_3_tiles.metadata.json").exists()
